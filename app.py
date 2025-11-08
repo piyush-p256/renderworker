@@ -238,6 +238,7 @@ def upload_chunk():
 
 async def upload_to_telegram_client(file_path, file_name, credentials):
     """Upload file using Telegram Client API (supports up to 2GB)"""
+    client = None
     try:
         # Create Telegram client with user session
         client = TelegramClient(
@@ -252,15 +253,30 @@ async def upload_to_telegram_client(file_path, file_name, credentials):
         if not await client.is_user_authorized():
             raise Exception("Telegram session not authorized. Please re-login in settings.")
         
-        # Get channel entity
-        channel_id = int(credentials['channel_id'])
-        if str(channel_id).startswith('-100'):
-            # Remove -100 prefix for telethon
-            channel_id = int(str(channel_id).replace('-100', ''))
+        # Get channel entity - Telethon needs the proper channel entity
+        channel_id = credentials['channel_id']
+        
+        # Convert Bot API channel ID to Telethon format
+        # Bot API uses -100xxxxxxxxxx format for supergroups/channels
+        # Telethon can work with the full negative ID or resolve it via get_entity
+        try:
+            # Try to get the entity using the channel_id directly
+            # This works for both formats
+            channel_entity = await client.get_entity(int(channel_id))
+        except Exception as e:
+            print(f"Failed to get entity with ID {channel_id}, trying alternative format: {e}")
+            # If channel_id is like -100xxxxxxxxxx, try without -100 prefix
+            if str(channel_id).startswith('-100'):
+                bare_id = int(str(channel_id).replace('-100', ''))
+                channel_entity = await client.get_entity(bare_id)
+            else:
+                raise Exception(f"Could not resolve channel ID {channel_id}: {str(e)}")
+        
+        print(f"Successfully resolved channel entity: {channel_entity}")
         
         # Upload file to channel
         message = await client.send_file(
-            channel_id,
+            channel_entity,
             file_path,
             caption=f'Uploaded: {file_name}',
             force_document=True
@@ -275,8 +291,10 @@ async def upload_to_telegram_client(file_path, file_name, credentials):
         # Get file_id from the message document
         if message.document:
             # For Telethon, we need to construct a file_id compatible with Bot API
-            # We'll use the document's access_hash and file_reference
+            # We'll use the document's id as file_id
             file_id = str(message.document.id)
+        
+        print(f"File uploaded successfully via Telethon: message_id={message_id}, file_id={file_id}")
         
         return {
             'messageId': message_id,
@@ -285,6 +303,8 @@ async def upload_to_telegram_client(file_path, file_name, credentials):
         }
         
     except Exception as e:
+        if client:
+            await client.disconnect()
         raise Exception(f"Telegram Client API upload failed: {str(e)}")
 
 @app.route('/complete-upload', methods=['POST', 'OPTIONS'])
