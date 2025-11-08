@@ -1,6 +1,6 @@
 # Render Web Service for TeleStore File Upload with Chunked Upload Support
 # Deploy this as a Web Service on Render
-# Supports large files up to 2GB with 50MB chunks
+# Supports large files up to 2GB with 5MB chunks (optimized for Render free tier)
 
 from flask import Flask, request, jsonify
 import requests
@@ -16,7 +16,7 @@ app = Flask(__name__)
 CONFIG = {
     'BACKEND_URL': os.environ.get('BACKEND_URL', 'https://settings-worker-link.preview.emergentagent.com'),
     'MAX_FILE_SIZE': 2000 * 1024 * 1024,  # 2GB
-    'CHUNK_SIZE': 8 * 1024 * 1024,  # 50MB chunks
+    'CHUNK_SIZE': 5 * 1024 * 1024,  # 5MB chunks (safe for Render free tier 10MB limit)
     'CACHE_DURATION': 3600,  # 1 hour in seconds
     'UPLOAD_FOLDER': '/tmp/tgdrive_chunks',  # Temporary folder for chunks
 }
@@ -96,6 +96,68 @@ def cleanup_upload(upload_id):
             del upload_sessions[upload_id]
     except Exception as e:
         print(f"Error cleaning up upload {upload_id}: {e}")
+
+@app.route('/', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({
+        'status': 'ok',
+        'service': 'TeleStore Render Upload Service',
+        'chunk_size': f"{CONFIG['CHUNK_SIZE'] // (1024 * 1024)}MB",
+        'endpoints': ['/init-upload', '/upload-chunk', '/complete-upload', '/upload-status/<id>', '/cancel-upload', '/upload']
+    })
+
+@app.route('/init-upload', methods=['POST', 'OPTIONS'])
+def init_upload():
+    """Initialize a chunked upload session"""
+    # Handle CORS
+    if request.method == 'OPTIONS':
+        response = jsonify({})
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+        return response
+    
+    try:
+        data = request.get_json()
+        upload_id = data.get('uploadId')
+        file_name = data.get('fileName')
+        total_chunks = data.get('totalChunks')
+        file_size = data.get('fileSize', 0)
+        
+        if not all([upload_id, file_name, total_chunks]):
+            return jsonify({'error': 'Missing required parameters'}), 400
+        
+        # Create session metadata
+        metadata = {
+            'upload_id': upload_id,
+            'file_name': file_name,
+            'file_size': file_size,
+            'total_chunks': total_chunks,
+            'received_chunks': [],
+            'created_at': datetime.now().isoformat()
+        }
+        
+        # Save metadata
+        metadata_path = get_session_metadata_path(upload_id)
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f)
+        
+        # Store in memory
+        upload_sessions[upload_id] = metadata
+        
+        response = jsonify({
+            'success': True,
+            'uploadId': upload_id,
+            'message': 'Upload session initialized'
+        })
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        return response
+        
+    except Exception as e:
+        response = jsonify({'error': str(e)})
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        return response, 500
 
 @app.route('/upload-chunk', methods=['POST', 'OPTIONS'])
 def upload_chunk():
