@@ -9,12 +9,15 @@ from datetime import datetime, timedelta
 import json
 import hashlib
 from pathlib import Path
+import asyncio
+from telethon import TelegramClient
+from telethon.sessions import StringSession
 
 app = Flask(__name__)
 
 # Configuration - only set BACKEND_URL, credentials will be fetched automatically
 CONFIG = {
-    'BACKEND_URL': os.environ.get('BACKEND_URL', 'https://settings-worker-link.preview.emergentagent.com'),
+    'BACKEND_URL': os.environ.get('BACKEND_URL', 'https://chunked-tg-upload.preview.emergentagent.com'),
     'MAX_FILE_SIZE': 2000 * 1024 * 1024,  # 2GB
     'CHUNK_SIZE': 5 * 1024 * 1024,  # 5MB chunks (safe for Render free tier 10MB limit)
     'CACHE_DURATION': 3600,  # 1 hour in seconds
@@ -233,6 +236,57 @@ def upload_chunk():
         response.headers['Access-Control-Allow-Origin'] = '*'
         return response, 500
 
+async def upload_to_telegram_client(file_path, file_name, credentials):
+    """Upload file using Telegram Client API (supports up to 2GB)"""
+    try:
+        # Create Telegram client with user session
+        client = TelegramClient(
+            StringSession(credentials['telegram_session']),
+            int(credentials['telegram_api_id']),
+            credentials['telegram_api_hash']
+        )
+        
+        await client.connect()
+        
+        # Check if authorized
+        if not await client.is_user_authorized():
+            raise Exception("Telegram session not authorized. Please re-login in settings.")
+        
+        # Get channel entity
+        channel_id = int(credentials['channel_id'])
+        if str(channel_id).startswith('-100'):
+            # Remove -100 prefix for telethon
+            channel_id = int(str(channel_id).replace('-100', ''))
+        
+        # Upload file to channel
+        message = await client.send_file(
+            channel_id,
+            file_path,
+            caption=f'Uploaded: {file_name}',
+            force_document=True
+        )
+        
+        await client.disconnect()
+        
+        # Extract message_id and file_id
+        message_id = message.id
+        file_id = None
+        
+        # Get file_id from the message document
+        if message.document:
+            # For Telethon, we need to construct a file_id compatible with Bot API
+            # We'll use the document's access_hash and file_reference
+            file_id = str(message.document.id)
+        
+        return {
+            'messageId': message_id,
+            'fileId': file_id,
+            'success': True
+        }
+        
+    except Exception as e:
+        raise Exception(f"Telegram Client API upload failed: {str(e)}")
+
 @app.route('/complete-upload', methods=['POST', 'OPTIONS'])
 def complete_upload():
     """Merge chunks and upload to Telegram"""
@@ -287,56 +341,90 @@ def complete_upload():
         # Get credentials
         credentials = get_credentials(user_id, auth_token)
         
-        # Upload to Telegram using streaming to avoid memory issues
-        with open(final_file_path, 'rb') as file_stream:
-            files = {
-                'document': (file_name, file_stream, 'application/octet-stream')
-            }
-            data = {
-                'chat_id': credentials['channel_id'],
-                'caption': f'Uploaded: {file_name}'
-            }
+        # For files > 50MB, use Telegram Client API (supports up to 2GB)
+        # Bot API only supports up to 50MB
+        BOT_API_LIMIT = 50 * 1024 * 1024  # 50MB
+        
+        if file_size > BOT_API_LIMIT:
+            # Use Telegram Client API for large files
+            print(f"File size {file_size} bytes > 50MB, using Telegram Client API")
             
-            # Use streaming upload with timeout for large files
-            telegram_response = requests.post(
-                f"https://api.telegram.org/bot{credentials['bot_token']}/sendDocument",
-                files=files,
-                data=data,
-                timeout=600  # 10 minute timeout for large files
+            # Run async upload in sync context
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                upload_result = loop.run_until_complete(
+                    upload_to_telegram_client(final_file_path, file_name, credentials)
+                )
+                message_id = upload_result['messageId']
+                file_id = upload_result['fileId']
+            finally:
+                loop.close()
+            
+            # Notify backend about the upload
+            requests.post(
+                f"{CONFIG['BACKEND_URL']}/api/webhook/upload",
+                json={
+                    'userId': user_id,
+                    'fileName': file_name,
+                    'messageId': message_id,
+                    'fileId': file_id,
+                    'size': file_size,
+                    'mimeType': 'application/octet-stream',
+                },
+                timeout=30
             )
-        
-        telegram_result = telegram_response.json()
-        
-        if not telegram_result.get('ok'):
-            raise Exception(telegram_result.get('description', 'Telegram upload failed'))
-        
-        message_id = telegram_result['result']['message_id']
-        
-        # Extract file_id from Telegram response
-        result = telegram_result['result']
-        file_id = (
-            result.get('document', {}).get('file_id') or
-            result.get('video', {}).get('file_id') or
-            result.get('audio', {}).get('file_id') or
-            (result.get('photo', [{}])[0].get('file_id') if result.get('photo') else None)
-        )
-        
-        if not file_id:
-            raise Exception('Failed to get file_id from Telegram response')
-        
-        # Notify backend
-        requests.post(
-            f"{CONFIG['BACKEND_URL']}/api/webhook/upload",
-            json={
-                'userId': user_id,
-                'fileName': file_name,
-                'messageId': message_id,
-                'fileId': file_id,
-                'size': file_size,
-                'mimeType': 'application/octet-stream',
-            },
-            timeout=30
-        )
+        else:
+            # For files <= 50MB, use Bot API directly (faster)
+            print(f"File size {file_size} bytes <= 50MB, using Bot API")
+            with open(final_file_path, 'rb') as file_stream:
+                files = {
+                    'document': (file_name, file_stream, 'application/octet-stream')
+                }
+                data = {
+                    'chat_id': credentials['channel_id'],
+                    'caption': f'Uploaded: {file_name}'
+                }
+                
+                telegram_response = requests.post(
+                    f"https://api.telegram.org/bot{credentials['bot_token']}/sendDocument",
+                    files=files,
+                    data=data,
+                    timeout=300  # 5 minute timeout
+                )
+            
+            telegram_result = telegram_response.json()
+            
+            if not telegram_result.get('ok'):
+                raise Exception(telegram_result.get('description', 'Telegram upload failed'))
+            
+            message_id = telegram_result['result']['message_id']
+            
+            # Extract file_id from Telegram response
+            result = telegram_result['result']
+            file_id = (
+                result.get('document', {}).get('file_id') or
+                result.get('video', {}).get('file_id') or
+                result.get('audio', {}).get('file_id') or
+                (result.get('photo', [{}])[0].get('file_id') if result.get('photo') else None)
+            )
+            
+            if not file_id:
+                raise Exception('Failed to get file_id from Telegram response')
+            
+            # Notify backend about the upload
+            requests.post(
+                f"{CONFIG['BACKEND_URL']}/api/webhook/upload",
+                json={
+                    'userId': user_id,
+                    'fileName': file_name,
+                    'messageId': message_id,
+                    'fileId': file_id,
+                    'size': file_size,
+                    'mimeType': 'application/octet-stream',
+                },
+                timeout=30
+            )
         
         # Clean up all chunks and temp files
         cleanup_upload(upload_id)
