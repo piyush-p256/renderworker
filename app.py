@@ -3,6 +3,7 @@
 # Supports large files up to 2GB with 5MB chunks (optimized for Render free tier)
 
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import requests
 import os
 from datetime import datetime, timedelta
@@ -14,6 +15,15 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 app = Flask(__name__)
+
+# Enable CORS for all routes
+CORS(app, resources={
+    r"/*": {
+        "origins": "*",
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"]
+    }
+})
 
 # Configuration - only set BACKEND_URL, credentials will be fetched automatically
 CONFIG = {
@@ -110,17 +120,9 @@ def health_check():
         'endpoints': ['/init-upload', '/upload-chunk', '/complete-upload', '/upload-status/<id>', '/cancel-upload', '/upload']
     })
 
-@app.route('/init-upload', methods=['POST', 'OPTIONS'])
+@app.route('/init-upload', methods=['POST'])
 def init_upload():
     """Initialize a chunked upload session"""
-    # Handle CORS
-    if request.method == 'OPTIONS':
-        response = jsonify({})
-        response.headers['Access-Control-Allow-Origin'] = '*'
-        response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
-        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
-        return response
-    
     try:
         data = request.get_json()
         upload_id = data.get('uploadId')
@@ -149,30 +151,18 @@ def init_upload():
         # Store in memory
         upload_sessions[upload_id] = metadata
         
-        response = jsonify({
+        return jsonify({
             'success': True,
             'uploadId': upload_id,
             'message': 'Upload session initialized'
         })
-        response.headers['Access-Control-Allow-Origin'] = '*'
-        return response
         
     except Exception as e:
-        response = jsonify({'error': str(e)})
-        response.headers['Access-Control-Allow-Origin'] = '*'
-        return response, 500
+        return jsonify({'error': str(e)}), 500
 
-@app.route('/upload-chunk', methods=['POST', 'OPTIONS'])
+@app.route('/upload-chunk', methods=['POST'])
 def upload_chunk():
     """Handle individual chunk uploads"""
-    # Handle CORS
-    if request.method == 'OPTIONS':
-        response = jsonify({})
-        response.headers['Access-Control-Allow-Origin'] = '*'
-        response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
-        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
-        return response
-    
     try:
         # Get chunk data
         chunk_file = request.files.get('chunk')
@@ -219,27 +209,34 @@ def upload_chunk():
         # Check if all chunks received
         all_received = len(metadata['received_chunks']) == total_chunks
         
-        response_data = {
+        return jsonify({
             'success': True,
             'chunk_index': chunk_index,
             'received_chunks': len(metadata['received_chunks']),
             'total_chunks': total_chunks,
             'complete': all_received
-        }
-        
-        response = jsonify(response_data)
-        response.headers['Access-Control-Allow-Origin'] = '*'
-        return response
+        })
         
     except Exception as e:
-        response = jsonify({'error': str(e)})
-        response.headers['Access-Control-Allow-Origin'] = '*'
-        return response, 500
+        return jsonify({'error': str(e)}), 500
 
 async def upload_to_telegram_client(file_path, file_name, credentials):
     """Upload file using Telegram Client API (supports up to 2GB)"""
     client = None
     try:
+        print(f"Starting Telethon upload for file: {file_name}")
+        print(f"File path: {file_path}, exists: {os.path.exists(file_path)}")
+        
+        # Validate credentials
+        if not credentials.get('telegram_session'):
+            raise Exception("telegram_session is missing. User must login to Telegram in TeleStore settings.")
+        if not credentials.get('telegram_api_id'):
+            raise Exception("telegram_api_id is missing in backend configuration.")
+        if not credentials.get('telegram_api_hash'):
+            raise Exception("telegram_api_hash is missing in backend configuration.")
+        if not credentials.get('channel_id'):
+            raise Exception("channel_id is missing.")
+        
         # Create Telegram client with user session
         client = TelegramClient(
             StringSession(credentials['telegram_session']),
@@ -247,14 +244,18 @@ async def upload_to_telegram_client(file_path, file_name, credentials):
             credentials['telegram_api_hash']
         )
         
+        print("Connecting to Telegram...")
         await client.connect()
         
         # Check if authorized
         if not await client.is_user_authorized():
-            raise Exception("Telegram session not authorized. Please re-login in settings.")
+            raise Exception("Telegram session not authorized. Please re-login in TeleStore settings.")
+        
+        print("Telegram client authorized successfully")
         
         # Get channel entity - Telethon needs the proper channel entity
         channel_id = credentials['channel_id']
+        print(f"Resolving channel entity for ID: {channel_id}")
         
         # Convert Bot API channel ID to Telethon format
         # Bot API uses -100xxxxxxxxxx format for supergroups/channels
@@ -263,18 +264,20 @@ async def upload_to_telegram_client(file_path, file_name, credentials):
             # Try to get the entity using the channel_id directly
             # This works for both formats
             channel_entity = await client.get_entity(int(channel_id))
+            print(f"Successfully resolved channel entity: {channel_entity}")
         except Exception as e:
             print(f"Failed to get entity with ID {channel_id}, trying alternative format: {e}")
             # If channel_id is like -100xxxxxxxxxx, try without -100 prefix
             if str(channel_id).startswith('-100'):
                 bare_id = int(str(channel_id).replace('-100', ''))
+                print(f"Trying with bare ID: {bare_id}")
                 channel_entity = await client.get_entity(bare_id)
+                print(f"Successfully resolved with bare ID: {channel_entity}")
             else:
                 raise Exception(f"Could not resolve channel ID {channel_id}: {str(e)}")
         
-        print(f"Successfully resolved channel entity: {channel_entity}")
-        
         # Upload file to channel
+        print(f"Uploading file to channel...")
         message = await client.send_file(
             channel_entity,
             file_path,
@@ -282,6 +285,7 @@ async def upload_to_telegram_client(file_path, file_name, credentials):
             force_document=True
         )
         
+        print(f"File sent successfully, disconnecting...")
         await client.disconnect()
         
         # Extract message_id and file_id
@@ -303,21 +307,21 @@ async def upload_to_telegram_client(file_path, file_name, credentials):
         }
         
     except Exception as e:
+        print(f"Error in upload_to_telegram_client: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        
         if client:
-            await client.disconnect()
+            try:
+                await client.disconnect()
+            except:
+                pass
         raise Exception(f"Telegram Client API upload failed: {str(e)}")
 
-@app.route('/complete-upload', methods=['POST', 'OPTIONS'])
+@app.route('/complete-upload', methods=['POST'])
 def complete_upload():
     """Merge chunks and upload to Telegram"""
-    # Handle CORS
-    if request.method == 'OPTIONS':
-        response = jsonify({})
-        response.headers['Access-Control-Allow-Origin'] = '*'
-        response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
-        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
-        return response
-    
+    upload_id = None
     try:
         data = request.get_json()
         upload_id = data.get('uploadId')
@@ -453,45 +457,39 @@ def complete_upload():
         if os.path.exists(final_file_path):
             os.remove(final_file_path)
         
-        response = jsonify({
+        return jsonify({
             'success': True,
             'messageId': message_id,
             'fileId': file_id,
             'fileName': file_name,
         })
-        response.headers['Access-Control-Allow-Origin'] = '*'
-        return response
         
     except Exception as e:
-        # Try to clean up on error
-        if 'upload_id' in locals():
-            cleanup_upload(upload_id)
+        print(f"Error in complete_upload: {str(e)}")
+        import traceback
+        traceback.print_exc()
         
-        response = jsonify({'error': str(e)})
-        response.headers['Access-Control-Allow-Origin'] = '*'
-        return response, 500
+        # Try to clean up on error
+        if upload_id:
+            try:
+                cleanup_upload(upload_id)
+            except:
+                pass
+        
+        return jsonify({'error': str(e)}), 500
 
-@app.route('/upload-status/<upload_id>', methods=['GET', 'OPTIONS'])
+@app.route('/upload-status/<upload_id>', methods=['GET'])
 def upload_status(upload_id):
     """Get status of an upload session"""
-    if request.method == 'OPTIONS':
-        response = jsonify({})
-        response.headers['Access-Control-Allow-Origin'] = '*'
-        response.headers['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
-        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
-        return response
-    
     try:
         metadata_path = get_session_metadata_path(upload_id)
         if not os.path.exists(metadata_path):
-            response = jsonify({'error': 'Upload session not found'})
-            response.headers['Access-Control-Allow-Origin'] = '*'
-            return response, 404
+            return jsonify({'error': 'Upload session not found'}), 404
         
         with open(metadata_path, 'r') as f:
             metadata = json.load(f)
         
-        response = jsonify({
+        return jsonify({
             'upload_id': upload_id,
             'file_name': metadata['file_name'],
             'total_chunks': metadata['total_chunks'],
@@ -499,24 +497,13 @@ def upload_status(upload_id):
             'received_chunk_indices': metadata['received_chunks'],
             'complete': len(metadata['received_chunks']) == metadata['total_chunks']
         })
-        response.headers['Access-Control-Allow-Origin'] = '*'
-        return response
         
     except Exception as e:
-        response = jsonify({'error': str(e)})
-        response.headers['Access-Control-Allow-Origin'] = '*'
-        return response, 500
+        return jsonify({'error': str(e)}), 500
 
-@app.route('/cancel-upload', methods=['POST', 'OPTIONS'])
+@app.route('/cancel-upload', methods=['POST'])
 def cancel_upload():
     """Cancel an upload and clean up chunks"""
-    if request.method == 'OPTIONS':
-        response = jsonify({})
-        response.headers['Access-Control-Allow-Origin'] = '*'
-        response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
-        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
-        return response
-    
     try:
         data = request.get_json()
         upload_id = data.get('uploadId')
@@ -526,27 +513,15 @@ def cancel_upload():
         
         cleanup_upload(upload_id)
         
-        response = jsonify({'success': True, 'message': 'Upload cancelled'})
-        response.headers['Access-Control-Allow-Origin'] = '*'
-        return response
+        return jsonify({'success': True, 'message': 'Upload cancelled'})
         
     except Exception as e:
-        response = jsonify({'error': str(e)})
-        response.headers['Access-Control-Allow-Origin'] = '*'
-        return response, 500
+        return jsonify({'error': str(e)}), 500
 
 # Legacy endpoint for small files (backwards compatibility)
-@app.route('/upload', methods=['POST', 'OPTIONS'])
+@app.route('/upload', methods=['POST'])
 def upload_file():
     """Legacy upload endpoint for small files"""
-    # Handle CORS
-    if request.method == 'OPTIONS':
-        response = jsonify({})
-        response.headers['Access-Control-Allow-Origin'] = '*'
-        response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
-        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
-        return response
-    
     try:
         file = request.files.get('file')
         user_id = request.form.get('userId')
@@ -616,19 +591,15 @@ def upload_file():
             }
         )
         
-        response = jsonify({
+        return jsonify({
             'success': True,
             'messageId': message_id,
             'fileId': file_id,
             'fileName': file_name,
         })
-        response.headers['Access-Control-Allow-Origin'] = '*'
-        return response
         
     except Exception as e:
-        response = jsonify({'error': str(e)})
-        response.headers['Access-Control-Allow-Origin'] = '*'
-        return response, 500
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
