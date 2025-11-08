@@ -16,7 +16,7 @@ app = Flask(__name__)
 CONFIG = {
     'BACKEND_URL': os.environ.get('BACKEND_URL', 'https://mega-upload.preview.emergentagent.com'),
     'MAX_FILE_SIZE': 2000 * 1024 * 1024,  # 2GB
-    'CHUNK_SIZE': 50 * 1024 * 1024,  # 50MB chunks
+    'CHUNK_SIZE': 8 * 1024 * 1024,  # 50MB chunks
     'CACHE_DURATION': 3600,  # 1 hour in seconds
     'UPLOAD_FOLDER': '/tmp/tgdrive_chunks',  # Temporary folder for chunks
 }
