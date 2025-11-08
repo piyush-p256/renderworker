@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 # Configuration - only set BACKEND_URL, credentials will be fetched automatically
 CONFIG = {
-    'BACKEND_URL': os.environ.get('BACKEND_URL', 'https://mega-upload.preview.emergentagent.com'),
+    'BACKEND_URL': os.environ.get('BACKEND_URL', 'https://settings-worker-link.preview.emergentagent.com'),
     'MAX_FILE_SIZE': 2000 * 1024 * 1024,  # 2GB
     'CHUNK_SIZE': 8 * 1024 * 1024,  # 50MB chunks
     'CACHE_DURATION': 3600,  # 1 hour in seconds
