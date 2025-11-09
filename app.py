@@ -1,376 +1,317 @@
-# Render Web Service for TeleStore File Upload with Chunked Upload Support
-# Deploy this as a Web Service on Render
-# Supports large files up to 2GB with 5MB chunks (optimized for Render free tier)
-
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
-import requests
 import os
-from datetime import datetime, timedelta
-import json
+import requests
 import hashlib
-from pathlib import Path
-import asyncio
+import json
+import time
+from datetime import datetime
 import threading
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.tl.types import DocumentAttributeFilename
+import asyncio
+from collections import defaultdict
 
 app = Flask(__name__)
+CORS(app, origins='*', supports_credentials=True)
 
-# Enable CORS for all routes
-CORS(app, resources={
-    r"/*": {
-        "origins": "*",
-        "methods": ["GET", "POST", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization"]
-    }
-})
-
-# Configuration - only set BACKEND_URL, credentials will be fetched automatically
+# Configuration
 CONFIG = {
-    'BACKEND_URL': os.environ.get('BACKEND_URL', 'https://bigload-solver.preview.emergentagent.com'),
-    'MAX_FILE_SIZE': 2000 * 1024 * 1024,  # 2GB
-    'CHUNK_SIZE': 5 * 1024 * 1024,  # 5MB chunks (safe for Render free tier 10MB limit)
-    'CACHE_DURATION': 3600,  # 1 hour in seconds
-    'UPLOAD_FOLDER': '/tmp/tgdrive_chunks',  # Temporary folder for chunks
+    'BACKEND_URL': os.environ.get('BACKEND_URL', 'https://chunked-file-fix.preview.emergentagent.com'),
+    'MAX_CHUNK_SIZE': 50 * 1024 * 1024,  # 50MB per chunk
+    'UPLOAD_DIR': '/tmp/uploads',
+    'BOT_API_SIZE_LIMIT': 50 * 1024 * 1024,  # 50MB - use Bot API up to 50MB
 }
 
-# Create upload folder if it doesn't exist
-os.makedirs(CONFIG['UPLOAD_FOLDER'], exist_ok=True)
-
-# In-memory cache for credentials
-credentials_cache = {
-    'data': None,
-    'timestamp': None,
-    'user_id': None
-}
-
-# In-memory tracking of upload sessions
-upload_sessions = {}
-
-# Track background upload progress
+# In-memory storage for credentials cache and upload progress
+credentials_cache = {}
 upload_progress = {}
-# Format: {upload_id: {'status': 'uploading'|'completed'|'failed', 'progress': 0-100, 'error': str, 'messageId': int, 'fileId': str}}
+upload_locks = defaultdict(threading.Lock)
 
-def get_credentials(user_id, auth_token):
-    """Fetch credentials from backend or return cached version"""
-    now = datetime.now()
+# Create upload directory if it doesn't exist
+os.makedirs(CONFIG['UPLOAD_DIR'], exist_ok=True)
+
+print(f"Worker started with BACKEND_URL: {CONFIG['BACKEND_URL']}")
+
+
+def get_credentials(auth_token):
+    """Fetch and cache user credentials from backend"""
+    # Check cache first (cache for 1 hour)
+    cache_key = hashlib.md5(auth_token.encode()).hexdigest()
+    if cache_key in credentials_cache:
+        cached_data, cached_time = credentials_cache[cache_key]
+        if time.time() - cached_time < 3600:  # 1 hour cache
+            return cached_data
     
-    # Return cached credentials if still valid and for same user
-    if (credentials_cache['data'] and 
-        credentials_cache['user_id'] == user_id and
-        credentials_cache['timestamp'] and
-        (now - credentials_cache['timestamp']).total_seconds() < CONFIG['CACHE_DURATION']):
-        return credentials_cache['data']
-    
-    # Fetch fresh credentials from backend
+    # Fetch from backend
     try:
         response = requests.get(
             f"{CONFIG['BACKEND_URL']}/api/worker/credentials",
-            headers={'Authorization': f'Bearer {auth_token}'}
+            headers={'Authorization': f'Bearer {auth_token}'},
+            timeout=10
         )
         
-        if response.status_code != 200:
-            raise Exception(f"Failed to fetch credentials: {response.text}")
-        
-        credentials = response.json()
-        
-        # Cache the credentials
-        credentials_cache['data'] = credentials
-        credentials_cache['timestamp'] = now
-        credentials_cache['user_id'] = user_id
-        
-        return credentials
+        if response.status_code == 200:
+            credentials = response.json()
+            credentials_cache[cache_key] = (credentials, time.time())
+            return credentials
+        else:
+            print(f"Failed to fetch credentials: {response.status_code}")
+            return None
     except Exception as e:
-        # If cache exists, use it even if expired (fallback)
-        if credentials_cache['data'] and credentials_cache['user_id'] == user_id:
-            print(f'Using expired cache due to fetch error: {e}')
-            return credentials_cache['data']
-        raise e
+        print(f"Error fetching credentials: {str(e)}")
+        return None
 
-def get_chunk_path(upload_id, chunk_index):
-    """Get the path for a specific chunk file"""
-    return os.path.join(CONFIG['UPLOAD_FOLDER'], f"{upload_id}_chunk_{chunk_index}")
 
-def get_session_metadata_path(upload_id):
-    """Get the path for upload session metadata"""
-    return os.path.join(CONFIG['UPLOAD_FOLDER'], f"{upload_id}_metadata.json")
-
-def cleanup_upload(upload_id):
-    """Clean up all chunks and metadata for an upload"""
-    try:
-        # Remove metadata file
-        metadata_path = get_session_metadata_path(upload_id)
-        if os.path.exists(metadata_path):
-            os.remove(metadata_path)
-        
-        # Remove all chunk files
-        for file in os.listdir(CONFIG['UPLOAD_FOLDER']):
-            if file.startswith(f"{upload_id}_chunk_"):
-                os.remove(os.path.join(CONFIG['UPLOAD_FOLDER'], file))
-        
-        # Remove from in-memory sessions
-        if upload_id in upload_sessions:
-            del upload_sessions[upload_id]
-    except Exception as e:
-        print(f"Error cleaning up upload {upload_id}: {e}")
-
-@app.route('/', methods=['GET'])
+@app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
-    return jsonify({
-        'status': 'ok',
-        'service': 'TeleStore Render Upload Service',
-        'chunk_size': f"{CONFIG['CHUNK_SIZE'] // (1024 * 1024)}MB",
-        'endpoints': ['/init-upload', '/upload-chunk', '/complete-upload', '/upload-status/<id>', '/cancel-upload', '/upload']
-    })
+    return jsonify({"status": "ok", "timestamp": datetime.now().isoformat()})
 
-@app.route('/init-upload', methods=['POST'])
-def init_upload():
-    """Initialize a chunked upload session"""
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    """Handle file upload - stores file temporarily and returns upload ID"""
+    try:
+        # Get auth token
+        auth_token = request.form.get('authToken')
+        if not auth_token:
+            return jsonify({'error': 'Missing auth token'}), 401
+        
+        # Get credentials
+        credentials = get_credentials(auth_token)
+        if not credentials:
+            return jsonify({'error': 'Failed to fetch credentials'}), 401
+        
+        # Get uploaded file
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file provided'}), 400
+        
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'error': 'Empty filename'}), 400
+        
+        # Generate upload ID
+        upload_id = hashlib.md5(f"{auth_token}{file.filename}{time.time()}".encode()).hexdigest()
+        file_path = os.path.join(CONFIG['UPLOAD_DIR'], upload_id)
+        
+        # Save file
+        file.save(file_path)
+        file_size = os.path.getsize(file_path)
+        
+        # Initialize upload progress
+        upload_progress[upload_id] = {
+            'status': 'uploaded',
+            'file_path': file_path,
+            'file_size': file_size,
+            'file_name': file.filename,
+            'credentials': credentials,
+            'telegram_progress': 0,
+            'message_id': None,
+            'file_id': None,
+            'error': None
+        }
+        
+        return jsonify({
+            'uploadId': upload_id,
+            'size': file_size
+        })
+        
+    except Exception as e:
+        print(f"Upload error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/complete-upload', methods=['POST'])
+def complete_upload():
+    """Complete the upload by sending to Telegram in background"""
     try:
         data = request.get_json()
         upload_id = data.get('uploadId')
-        file_name = data.get('fileName')
-        total_chunks = data.get('totalChunks')
-        file_size = data.get('fileSize', 0)
         
-        if not all([upload_id, file_name, total_chunks]):
-            return jsonify({'error': 'Missing required parameters'}), 400
+        if not upload_id or upload_id not in upload_progress:
+            return jsonify({'error': 'Invalid upload ID'}), 400
         
-        # Create session metadata
-        metadata = {
-            'upload_id': upload_id,
-            'file_name': file_name,
-            'file_size': file_size,
-            'total_chunks': total_chunks,
-            'received_chunks': [],
-            'created_at': datetime.now().isoformat()
-        }
+        progress = upload_progress[upload_id]
         
-        # Save metadata
-        metadata_path = get_session_metadata_path(upload_id)
-        with open(metadata_path, 'w') as f:
-            json.dump(metadata, f)
+        if progress['status'] == 'uploading':
+            return jsonify({'error': 'Upload already in progress'}), 400
         
-        # Store in memory
-        upload_sessions[upload_id] = metadata
+        if progress['status'] == 'completed':
+            return jsonify({
+                'status': 'completed',
+                'messageId': progress['message_id'],
+                'fileId': progress['file_id']
+            })
         
+        # Start upload in background thread
+        progress['status'] = 'uploading'
+        progress['telegram_progress'] = 0
+        
+        thread = threading.Thread(
+            target=upload_to_telegram_background,
+            args=(upload_id,)
+        )
+        thread.daemon = True
+        thread.start()
+        
+        # Return immediately
         return jsonify({
-            'success': True,
-            'uploadId': upload_id,
-            'message': 'Upload session initialized'
-        })
-        
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/upload-chunk', methods=['POST'])
-def upload_chunk():
-    """Handle individual chunk uploads"""
-    try:
-        # Get chunk data
-        chunk_file = request.files.get('chunk')
-        upload_id = request.form.get('uploadId')
-        chunk_index = int(request.form.get('chunkIndex'))
-        total_chunks = int(request.form.get('totalChunks'))
-        file_name = request.form.get('fileName')
-        file_size = int(request.form.get('fileSize'))
-        user_id = request.form.get('userId')
-        auth_token = request.form.get('authToken')
-        
-        if not all([chunk_file, upload_id, file_name, auth_token]):
-            return jsonify({'error': 'Missing required parameters'}), 400
-        
-        # Save chunk to disk
-        chunk_path = get_chunk_path(upload_id, chunk_index)
-        chunk_file.save(chunk_path)
-        
-        # Update session metadata
-        metadata_path = get_session_metadata_path(upload_id)
-        if os.path.exists(metadata_path):
-            with open(metadata_path, 'r') as f:
-                metadata = json.load(f)
-        else:
-            metadata = {
-                'upload_id': upload_id,
-                'file_name': file_name,
-                'file_size': file_size,
-                'total_chunks': total_chunks,
-                'received_chunks': [],
-                'user_id': user_id,
-                'auth_token': auth_token,
-                'created_at': datetime.now().isoformat()
-            }
-        
-        # Mark chunk as received
-        if chunk_index not in metadata['received_chunks']:
-            metadata['received_chunks'].append(chunk_index)
-        
-        # Save updated metadata
-        with open(metadata_path, 'w') as f:
-            json.dump(metadata, f)
-        
-        # Check if all chunks received
-        all_received = len(metadata['received_chunks']) == total_chunks
-        
-        return jsonify({
-            'success': True,
-            'chunk_index': chunk_index,
-            'received_chunks': len(metadata['received_chunks']),
-            'total_chunks': total_chunks,
-            'complete': all_received
-        })
-        
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-def background_upload_to_telegram(upload_id, file_path, file_name, file_size, credentials, user_id, auth_token):
-    """Background task to upload file to Telegram (runs in separate thread)"""
-    try:
-        print(f"[{upload_id}] Background upload started for: {file_name} ({file_size} bytes)")
-        upload_progress[upload_id] = {
             'status': 'uploading',
-            'progress': 0,
-            'error': None,
-            'messageId': None,
-            'fileId': None
-        }
+            'uploadId': upload_id,
+            'message': 'Upload to Telegram started in background'
+        })
         
-        BOT_API_LIMIT = 50 * 1024 * 1024  # 50MB
-        
-        if file_size > BOT_API_LIMIT:
-            # Use Telegram Client API for large files
-            print(f"[{upload_id}] Using Telethon Client API (file > 50MB)")
-            
-            # Run async upload in new event loop
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                result = loop.run_until_complete(
-                    upload_to_telegram_client_async(upload_id, file_path, file_name, credentials)
-                )
-                message_id = result['messageId']
-                file_id = result['fileId']
-            finally:
-                loop.close()
-        else:
-            # Use Bot API for small files
-            print(f"[{upload_id}] Using Bot API (file <= 50MB)")
-            with open(file_path, 'rb') as file_stream:
-                files = {
-                    'document': (file_name, file_stream, 'application/octet-stream')
-                }
-                data = {
-                    'chat_id': credentials['channel_id'],
-                    'caption': f'Uploaded: {file_name}'
-                }
-                
-                telegram_response = requests.post(
-                    f"https://api.telegram.org/bot{credentials['bot_token']}/sendDocument",
-                    files=files,
-                    data=data,
-                    timeout=300
-                )
-            
-            telegram_result = telegram_response.json()
-            
-            if not telegram_result.get('ok'):
-                raise Exception(telegram_result.get('description', 'Telegram upload failed'))
-            
-            message_id = telegram_result['result']['message_id']
-            
-            # Extract file_id
-            result = telegram_result['result']
-            file_id = (
-                result.get('document', {}).get('file_id') or
-                result.get('video', {}).get('file_id') or
-                result.get('audio', {}).get('file_id') or
-                (result.get('photo', [{}])[0].get('file_id') if result.get('photo') else None)
-            )
-            
-            if not file_id:
-                raise Exception('Failed to get file_id from Telegram response')
-        
-        # Update progress to completed
-        upload_progress[upload_id] = {
-            'status': 'completed',
-            'progress': 100,
-            'error': None,
-            'messageId': message_id,
-            'fileId': file_id
-        }
-        
-        print(f"[{upload_id}] Upload completed successfully")
-        
-        # Notify backend
-        try:
-            requests.post(
-                f"{CONFIG['BACKEND_URL']}/api/webhook/upload",
-                json={
-                    'userId': user_id,
-                    'fileName': file_name,
-                    'messageId': message_id,
-                    'fileId': file_id,
-                    'size': file_size,
-                    'mimeType': 'application/octet-stream',
-                },
-                timeout=30
-            )
-            print(f"[{upload_id}] Backend notified")
-        except Exception as e:
-            print(f"[{upload_id}] Failed to notify backend: {e}")
-        
-        # Clean up file after successful upload
-        try:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-                print(f"[{upload_id}] Cleaned up file: {file_path}")
-        except Exception as e:
-            print(f"[{upload_id}] Failed to cleanup file: {e}")
-            
     except Exception as e:
-        print(f"[{upload_id}] Upload failed: {str(e)}")
+        print(f"Complete upload error: {str(e)}")
         import traceback
         traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+def upload_to_telegram_background(upload_id):
+    """Background function to upload file to Telegram"""
+    try:
+        progress = upload_progress[upload_id]
+        file_path = progress['file_path']
+        file_size = progress['file_size']
+        credentials = progress['credentials']
         
-        upload_progress[upload_id] = {
-            'status': 'failed',
-            'progress': 0,
-            'error': str(e),
-            'messageId': None,
-            'fileId': None
-        }
-        
-        # Clean up file on error
+        # Decide whether to use Bot API or Client API
+        if file_size <= CONFIG['BOT_API_SIZE_LIMIT']:
+            # Use Bot API for files <= 50MB
+            upload_with_bot_api(upload_id, file_path, credentials)
+        else:
+            # Use Telethon Client API for files > 50MB
+            upload_with_client_api(upload_id, file_path, credentials)
+            
+    except Exception as e:
+        print(f"Background upload error for {upload_id}: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        upload_progress[upload_id]['status'] = 'failed'
+        upload_progress[upload_id]['error'] = str(e)
+    finally:
+        # Cleanup file after upload (success or failure)
         try:
             if os.path.exists(file_path):
                 os.remove(file_path)
-        except:
-            pass
+                print(f"Cleaned up temporary file: {file_path}")
+        except Exception as e:
+            print(f"Error cleaning up file: {str(e)}")
 
 
-async def upload_to_telegram_client_async(upload_id, file_path, file_name, credentials):
-    """Async function to upload file using Telegram Client API"""
-    client = None
+def upload_with_bot_api(upload_id, file_path, credentials):
+    """Upload file using Telegram Bot API (files <= 50MB)"""
     try:
-        print(f"[{upload_id}] Starting Telethon upload")
+        progress = upload_progress[upload_id]
+        bot_token = credentials.get('bot_token')
+        channel_id = credentials.get('channel_id')
+        file_name = progress['file_name']
         
-        # Validate credentials
-        if not credentials.get('telegram_session'):
-            raise Exception("telegram_session is missing")
-        if not credentials.get('telegram_api_id'):
-            raise Exception("telegram_api_id is missing")
-        if not credentials.get('telegram_api_hash'):
-            raise Exception("telegram_api_hash is missing")
-        if not credentials.get('channel_id'):
-            raise Exception("channel_id is missing")
+        if not bot_token or not channel_id:
+            raise Exception("Bot token or channel ID not configured")
+        
+        print(f"Uploading {file_name} via Bot API...")
+        
+        # Upload file to Telegram
+        with open(file_path, 'rb') as f:
+            files = {'document': (file_name, f)}
+            data = {'chat_id': channel_id}
+            
+            response = requests.post(
+                f'https://api.telegram.org/bot{bot_token}/sendDocument',
+                data=data,
+                files=files,
+                timeout=300  # 5 minutes timeout
+            )
+        
+        result = response.json()
+        
+        if not result.get('ok'):
+            raise Exception(f"Telegram API error: {result.get('description', 'Unknown error')}")
+        
+        # Extract file_id from response
+        telegram_result = result['result']
+        file_id = (
+            telegram_result.get('document', {}).get('file_id') or
+            telegram_result.get('video', {}).get('file_id') or
+            telegram_result.get('audio', {}).get('file_id') or
+            (telegram_result.get('photo', [{}])[0].get('file_id') if telegram_result.get('photo') else None)
+        )
+        
+        if not file_id:
+            raise Exception('Failed to get file_id from Telegram response')
         
         # Update progress
-        upload_progress[upload_id]['progress'] = 10
+        progress['status'] = 'completed'
+        progress['telegram_progress'] = 100
+        progress['message_id'] = telegram_result['message_id']
+        progress['file_id'] = file_id
         
-        # Create client
+        print(f"Bot API upload completed: message_id={telegram_result['message_id']}, file_id={file_id}")
+        
+    except Exception as e:
+        print(f"Bot API upload error: {str(e)}")
+        raise
+
+
+def upload_with_client_api(upload_id, file_path, credentials):
+    """Upload large file using Telethon Client API (files > 50MB)"""
+    try:
+        progress = upload_progress[upload_id]
+        file_name = progress['file_name']
+        
+        # Validate credentials
+        required_fields = ['telegram_session', 'telegram_api_id', 'telegram_api_hash', 'channel_id']
+        missing_fields = [field for field in required_fields if not credentials.get(field)]
+        
+        if missing_fields:
+            raise Exception(f"Missing required credentials: {', '.join(missing_fields)}")
+        
+        print(f"Uploading {file_name} via Telethon Client API...")
+        print(f"Credentials check: session={'present' if credentials.get('telegram_session') else 'missing'}, "
+              f"api_id={credentials.get('telegram_api_id')}, channel_id={credentials.get('channel_id')}")
+        
+        # Run async upload in new event loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            result = loop.run_until_complete(
+                upload_to_telegram_client(
+                    file_path,
+                    file_name,
+                    credentials,
+                    upload_id
+                )
+            )
+            
+            # Update progress with result
+            progress['status'] = 'completed'
+            progress['telegram_progress'] = 100
+            progress['message_id'] = result['message_id']
+            progress['file_id'] = result['file_id']
+            
+            print(f"Telethon upload completed: message_id={result['message_id']}, file_id={result['file_id']}")
+            
+        finally:
+            loop.close()
+            
+    except Exception as e:
+        print(f"Client API upload error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise
+
+
+async def upload_to_telegram_client(file_path, file_name, credentials, upload_id):
+    """Upload file to Telegram using Telethon with progress tracking"""
+    client = None
+    try:
+        # Initialize Telethon client
         client = TelegramClient(
             StringSession(credentials['telegram_session']),
             int(credentials['telegram_api_id']),
@@ -378,219 +319,78 @@ async def upload_to_telegram_client_async(upload_id, file_path, file_name, crede
         )
         
         await client.connect()
+        print("Telethon client connected")
         
-        if not await client.is_user_authorized():
-            raise Exception("Telegram session not authorized")
+        # Get channel entity
+        channel_id = int(credentials['channel_id'])
+        channel = await client.get_entity(channel_id)
+        print(f"Channel entity resolved: {channel.id}")
         
-        print(f"[{upload_id}] Connected to Telegram")
-        upload_progress[upload_id]['progress'] = 20
-        
-        # Resolve channel
-        channel_id = credentials['channel_id']
-        try:
-            channel_entity = await client.get_entity(int(channel_id))
-        except Exception as e:
-            if str(channel_id).startswith('-100'):
-                bare_id = int(str(channel_id).replace('-100', ''))
-                channel_entity = await client.get_entity(bare_id)
-            else:
-                raise Exception(f"Could not resolve channel: {str(e)}")
-        
-        print(f"[{upload_id}] Channel resolved")
-        upload_progress[upload_id]['progress'] = 30
-        
-        # Upload with progress callback
+        # Progress callback
         def progress_callback(current, total):
-            if total > 0:
-                percent = 30 + int((current / total) * 60)  # 30-90%
-                upload_progress[upload_id]['progress'] = percent
-                print(f"[{upload_id}] Upload progress: {percent}% ({current}/{total})")
+            progress_percent = int((current / total) * 100)
+            upload_progress[upload_id]['telegram_progress'] = progress_percent
+            if progress_percent % 10 == 0:  # Log every 10%
+                print(f"Upload progress: {progress_percent}% ({current}/{total} bytes)")
         
+        # Upload file
+        print(f"Starting Telethon upload: {file_name}")
         message = await client.send_file(
-            channel_entity,
+            channel,
             file_path,
-            caption=f'Uploaded: {file_name}',
-            force_document=True,
+            caption=file_name,
             progress_callback=progress_callback
         )
         
-        upload_progress[upload_id]['progress'] = 95
+        print(f"Telethon upload successful: message_id={message.id}")
         
-        await client.disconnect()
-        
-        message_id = message.id
-        file_id = str(message.document.id) if message.document else None
-        
-        print(f"[{upload_id}] Upload completed: message_id={message_id}")
+        # Extract file_id from message
+        file_id = None
+        if message.document:
+            file_id = message.document.id
+        elif message.video:
+            file_id = message.video.id
+        elif message.audio:
+            file_id = message.audio.id
+        elif message.photo:
+            file_id = message.photo.id
         
         return {
-            'messageId': message_id,
-            'fileId': file_id,
-            'success': True
+            'message_id': message.id,
+            'file_id': str(file_id) if file_id else None
         }
         
-    except Exception as e:
-        print(f"[{upload_id}] Telethon error: {str(e)}")
+    finally:
         if client:
-            try:
-                await client.disconnect()
-            except:
-                pass
-        raise
+            await client.disconnect()
+            print("Telethon client disconnected")
 
-@app.route('/complete-upload', methods=['POST'])
-def complete_upload():
-    """Merge chunks and start background upload to Telegram"""
-    upload_id = None
-    try:
-        data = request.get_json()
-        upload_id = data.get('uploadId')
-        
-        if not upload_id:
-            return jsonify({'error': 'Missing upload ID'}), 400
-        
-        # Load metadata
-        metadata_path = get_session_metadata_path(upload_id)
-        if not os.path.exists(metadata_path):
-            return jsonify({'error': 'Upload session not found'}), 404
-        
-        with open(metadata_path, 'r') as f:
-            metadata = json.load(f)
-        
-        file_name = metadata['file_name']
-        total_chunks = metadata['total_chunks']
-        user_id = metadata['user_id']
-        auth_token = metadata['auth_token']
-        
-        # Verify all chunks received
-        if len(metadata['received_chunks']) != total_chunks:
-            return jsonify({
-                'error': 'Not all chunks received',
-                'received': len(metadata['received_chunks']),
-                'total': total_chunks
-            }), 400
-        
-        # Merge chunks into final file
-        final_file_path = os.path.join(CONFIG['UPLOAD_FOLDER'], f"{upload_id}_final")
-        with open(final_file_path, 'wb') as final_file:
-            for chunk_index in sorted(metadata['received_chunks']):
-                chunk_path = get_chunk_path(upload_id, chunk_index)
-                if os.path.exists(chunk_path):
-                    with open(chunk_path, 'rb') as chunk_file:
-                        final_file.write(chunk_file.read())
-        
-        # Get file size
-        file_size = os.path.getsize(final_file_path)
-        
-        # Get credentials
-        credentials = get_credentials(user_id, auth_token)
-        
-        # Clean up chunks (keep merged file for background upload)
-        for chunk_index in metadata['received_chunks']:
-            chunk_path = get_chunk_path(upload_id, chunk_index)
-            if os.path.exists(chunk_path):
-                os.remove(chunk_path)
-        
-        # Remove metadata file
-        if os.path.exists(metadata_path):
-            os.remove(metadata_path)
-        
-        # Start background upload in separate thread
-        upload_thread = threading.Thread(
-            target=background_upload_to_telegram,
-            args=(upload_id, final_file_path, file_name, file_size, credentials, user_id, auth_token),
-            daemon=True
-        )
-        upload_thread.start()
-        
-        print(f"[{upload_id}] Background upload thread started")
-        
-        # Return immediately - client will poll for progress
-        return jsonify({
-            'success': True,
-            'uploadId': upload_id,
-            'message': 'Upload started in background',
-            'checkProgressAt': f'/upload-progress/{upload_id}'
-        })
-        
-    except Exception as e:
-        print(f"Error in complete_upload: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        
-        # Try to clean up on error
-        if upload_id:
-            try:
-                cleanup_upload(upload_id)
-            except:
-                pass
-        
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/upload-status/<upload_id>', methods=['GET'])
-def upload_status(upload_id):
-    """Get status of chunk upload session (before merging)"""
-    try:
-        metadata_path = get_session_metadata_path(upload_id)
-        if not os.path.exists(metadata_path):
-            return jsonify({'error': 'Upload session not found'}), 404
-        
-        with open(metadata_path, 'r') as f:
-            metadata = json.load(f)
-        
-        return jsonify({
-            'upload_id': upload_id,
-            'file_name': metadata['file_name'],
-            'total_chunks': metadata['total_chunks'],
-            'received_chunks': len(metadata['received_chunks']),
-            'received_chunk_indices': metadata['received_chunks'],
-            'complete': len(metadata['received_chunks']) == metadata['total_chunks']
-        })
-        
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
 
 @app.route('/upload-progress/<upload_id>', methods=['GET'])
-def upload_progress_status(upload_id):
-    """Get progress of background Telegram upload"""
+def get_upload_progress(upload_id):
+    """Get upload progress for a specific upload ID"""
     try:
         if upload_id not in upload_progress:
-            return jsonify({'error': 'Upload not found or not started'}), 404
+            return jsonify({'error': 'Upload ID not found'}), 404
         
-        progress_data = upload_progress[upload_id]
+        progress = upload_progress[upload_id]
         
         return jsonify({
-            'uploadId': upload_id,
-            'status': progress_data['status'],
-            'progress': progress_data['progress'],
-            'error': progress_data['error'],
-            'messageId': progress_data['messageId'],
-            'fileId': progress_data['fileId']
+            'status': progress['status'],
+            'telegram_progress': progress['telegram_progress'],
+            'message_id': progress['message_id'],
+            'file_id': progress['file_id'],
+            'error': progress['error']
         })
         
     except Exception as e:
+        print(f"Progress check error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/cancel-upload', methods=['POST'])
-def cancel_upload():
-    """Cancel an upload and clean up chunks"""
-    try:
-        data = request.get_json()
-        upload_id = data.get('uploadId')
-        
-        if not upload_id:
-            return jsonify({'error': 'Missing upload ID'}), 400
-        
-        cleanup_upload(upload_id)
-        
-        return jsonify({'success': True, 'message': 'Upload cancelled'})
-        
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
 
 @app.route('/download', methods=['GET'])
 def download_file():
-    """Download large files from Telegram using Telethon streaming"""
+    """Download files from Telegram with Range request support for chunked downloads"""
     try:
         message_id = request.args.get('messageId')
         token = request.args.get('token')
@@ -615,72 +415,31 @@ def download_file():
             print(f"Token verification failed: {str(e)}")
             return jsonify({'error': 'Failed to verify token'}), 401
         
-        # Stream file from Telegram using Telethon
-        def generate_file_stream():
-            """Generator function to stream file in chunks"""
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-            try:
-                # Initialize Telethon client
-                client = TelegramClient(
-                    StringSession(credentials['telegram_session']),
-                    int(credentials['telegram_api_id']),
-                    credentials['telegram_api_hash']
-                )
-                
-                async def download_and_stream():
-                    chunks = []
-                    await client.connect()
-                    
-                    try:
-                        # Get the channel entity
-                        channel = await client.get_entity(int(credentials['channel_id']))
-                        
-                        # Get the message containing the file
-                        message = await client.get_messages(channel, ids=int(message_id))
-                        
-                        if not message:
-                            raise Exception(f"Message {message_id} not found in channel")
-                        
-                        # Download file in chunks from the message
-                        chunk_size = 1024 * 1024  # 1MB chunks
-                        async for chunk in client.iter_download(message, chunk_size=chunk_size):
-                            chunks.append(chunk)
-                    
-                    finally:
-                        await client.disconnect()
-                    
-                    return chunks
-                
-                # Run the async download and get all chunks
-                chunks = loop.run_until_complete(download_and_stream())
-                
-                # Yield chunks synchronously
-                for chunk in chunks:
-                    yield chunk
-            
-            except Exception as e:
-                print(f"Download streaming error: {str(e)}")
-                import traceback
-                traceback.print_exc()
-                # Yield empty on error
-                yield b''
-            
-            finally:
-                loop.close()
+        # Get Range header if present
+        range_header = request.headers.get('Range')
         
-        # Return streaming response
-        from flask import Response
-        return Response(
-            generate_file_stream(),
-            mimetype='application/octet-stream',
-            headers={
-                'Content-Disposition': f'attachment; filename="{file_name}"',
-                'Cache-Control': 'no-cache',
-                'X-Accel-Buffering': 'no'  # Disable nginx buffering
-            }
-        )
+        if range_header:
+            # Parse range header: "bytes=0-5242879"
+            try:
+                range_start, range_end = range_header.replace('bytes=', '').split('-')
+                range_start = int(range_start)
+                range_end = int(range_end) if range_end else None
+            except:
+                return jsonify({'error': 'Invalid Range header'}), 416
+            
+            print(f"Range request: {range_start}-{range_end}")
+            
+            # Stream specific byte range from Telegram
+            return stream_file_range(
+                message_id, 
+                credentials, 
+                file_name, 
+                range_start, 
+                range_end
+            )
+        else:
+            # Full file download (for small files or legacy support)
+            return stream_full_file(message_id, credentials, file_name)
         
     except Exception as e:
         print(f"Download error: {str(e)}")
@@ -688,88 +447,149 @@ def download_file():
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
-# Legacy endpoint for small files (backwards compatibility)
-@app.route('/upload', methods=['POST'])
-def upload_file():
-    """Legacy upload endpoint for small files"""
-    try:
-        file = request.files.get('file')
-        user_id = request.form.get('userId')
-        auth_token = request.form.get('authToken')
-        file_name = request.form.get('fileName') or file.filename
+
+def stream_file_range(message_id, credentials, file_name, range_start, range_end):
+    """Stream a specific byte range from Telegram file"""
+    def generate():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        client = None
         
-        if not file:
-            return jsonify({'error': 'No file provided'}), 400
-        
-        if not auth_token:
-            return jsonify({'error': 'Auth token required'}), 400
-        
-        # Check file size
-        file.seek(0, 2)
-        file_size = file.tell()
-        file.seek(0)
-        
-        if file_size > CONFIG['MAX_FILE_SIZE']:
-            return jsonify({'error': 'File too large (max 2GB)'}), 400
-        
-        # Fetch credentials from backend (or use cache)
-        credentials = get_credentials(user_id, auth_token)
-        
-        # Upload to Telegram
-        files = {
-            'document': (file_name, file.read(), file.content_type)
+        try:
+            client = TelegramClient(
+                StringSession(credentials['telegram_session']),
+                int(credentials['telegram_api_id']),
+                credentials['telegram_api_hash']
+            )
+            
+            async def download_range():
+                await client.connect()
+                
+                try:
+                    # Get channel and message
+                    channel = await client.get_entity(int(credentials['channel_id']))
+                    message = await client.get_messages(channel, ids=int(message_id))
+                    
+                    if not message:
+                        raise Exception(f"Message {message_id} not found")
+                    
+                    # Get file size
+                    file_size = message.file.size if message.file else 0
+                    
+                    # Adjust range_end if not specified or exceeds file size
+                    actual_end = min(range_end if range_end else file_size - 1, file_size - 1)
+                    
+                    # Download specific byte range
+                    chunks = []
+                    bytes_to_download = actual_end - range_start + 1
+                    chunk_size = 512 * 1024  # 512KB chunks for smooth streaming
+                    
+                    print(f"Downloading range {range_start}-{actual_end} ({bytes_to_download} bytes)")
+                    
+                    async for chunk in client.iter_download(
+                        message.media,
+                        offset=range_start,
+                        limit=bytes_to_download,
+                        chunk_size=chunk_size
+                    ):
+                        chunks.append(chunk)
+                    
+                    return chunks, file_size, actual_end
+                    
+                finally:
+                    await client.disconnect()
+            
+            # Download the range
+            chunks, file_size, actual_end = loop.run_until_complete(download_range())
+            
+            # Yield chunks
+            for chunk in chunks:
+                yield chunk
+                
+        except Exception as e:
+            print(f"Range download error: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            yield b''
+            
+        finally:
+            if loop:
+                loop.close()
+    
+    # Return partial content response (206)
+    return Response(
+        stream_with_context(generate()),
+        status=206,
+        mimetype='application/octet-stream',
+        headers={
+            'Content-Disposition': f'attachment; filename="{file_name}"',
+            'Accept-Ranges': 'bytes',
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no'
         }
-        data = {
-            'chat_id': credentials['channel_id'],
-            'caption': f'Uploaded: {file_name}'
+    )
+
+
+def stream_full_file(message_id, credentials, file_name):
+    """Stream entire file (for small files or legacy support)"""
+    def generate():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        client = None
+        
+        try:
+            client = TelegramClient(
+                StringSession(credentials['telegram_session']),
+                int(credentials['telegram_api_id']),
+                credentials['telegram_api_hash']
+            )
+            
+            async def download_full():
+                await client.connect()
+                
+                try:
+                    channel = await client.get_entity(int(credentials['channel_id']))
+                    message = await client.get_messages(channel, ids=int(message_id))
+                    
+                    if not message:
+                        raise Exception(f"Message {message_id} not found")
+                    
+                    chunks = []
+                    async for chunk in client.iter_download(message.media, chunk_size=512 * 1024):
+                        chunks.append(chunk)
+                    
+                    return chunks
+                    
+                finally:
+                    await client.disconnect()
+            
+            chunks = loop.run_until_complete(download_full())
+            
+            for chunk in chunks:
+                yield chunk
+                
+        except Exception as e:
+            print(f"Full download error: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            yield b''
+            
+        finally:
+            if loop:
+                loop.close()
+    
+    return Response(
+        stream_with_context(generate()),
+        mimetype='application/octet-stream',
+        headers={
+            'Content-Disposition': f'attachment; filename="{file_name}"',
+            'Accept-Ranges': 'bytes',
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no'
         }
-        
-        telegram_response = requests.post(
-            f"https://api.telegram.org/bot{credentials['bot_token']}/sendDocument",
-            files=files,
-            data=data
-        )
-        
-        telegram_result = telegram_response.json()
-        
-        if not telegram_result.get('ok'):
-            raise Exception(telegram_result.get('description', 'Telegram upload failed'))
-        
-        message_id = telegram_result['result']['message_id']
-        
-        result = telegram_result['result']
-        file_id = (
-            result.get('document', {}).get('file_id') or
-            result.get('video', {}).get('file_id') or
-            result.get('audio', {}).get('file_id') or
-            (result.get('photo', [{}])[0].get('file_id') if result.get('photo') else None)
-        )
-        
-        if not file_id:
-            raise Exception('Failed to get file_id from Telegram response')
-        
-        # Notify backend
-        requests.post(
-            f"{CONFIG['BACKEND_URL']}/api/webhook/upload",
-            json={
-                'userId': user_id,
-                'fileName': file_name,
-                'messageId': message_id,
-                'fileId': file_id,
-                'size': file_size,
-                'mimeType': file.content_type,
-            }
-        )
-        
-        return jsonify({
-            'success': True,
-            'messageId': message_id,
-            'fileId': file_id,
-            'fileName': file_name,
-        })
-        
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    )
+
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
+    # For local development only
+    app.run(host='0.0.0.0', port=10000, debug=True)
