@@ -7,6 +7,7 @@ import json
 import time
 from datetime import datetime
 import threading
+import queue
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 import asyncio
@@ -421,10 +422,16 @@ def download_file():
         if range_header:
             # Parse range header: "bytes=0-5242879"
             try:
-                range_start, range_end = range_header.replace('bytes=', '').split('-')
-                range_start = int(range_start)
-                range_end = int(range_end) if range_end else None
-            except:
+                range_str = range_header.replace('bytes=', '')
+                if '-' in range_str:
+                    parts = range_str.split('-')
+                    range_start = int(parts[0]) if parts[0] else 0
+                    range_end = int(parts[1]) if parts[1] else None
+                else:
+                    range_start = 0
+                    range_end = None
+            except Exception as e:
+                print(f"Error parsing Range header '{range_header}': {e}")
                 return jsonify({'error': 'Invalid Range header'}), 416
             
             print(f"Range request: {range_start}-{range_end}")
@@ -439,6 +446,7 @@ def download_file():
             )
         else:
             # Full file download (for small files or legacy support)
+            print(f"Full file download request: {file_name}")
             return stream_full_file(message_id, credentials, file_name)
         
     except Exception as e:
@@ -449,72 +457,94 @@ def download_file():
 
 
 def stream_file_range(message_id, credentials, file_name, range_start, range_end):
-    """Stream a specific byte range from Telegram file"""
-    def generate():
+    """Stream a specific byte range from Telegram file using queue-based async bridge"""
+    
+    # Create queue for passing chunks from async thread to sync generator
+    chunk_queue = queue.Queue(maxsize=10)  # Buffer up to 10 chunks
+    error_holder = {'error': None}
+    
+    def async_download_worker():
+        """Background thread that runs async download and puts chunks in queue"""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        client = None
         
         try:
-            client = TelegramClient(
-                StringSession(credentials['telegram_session']),
-                int(credentials['telegram_api_id']),
-                credentials['telegram_api_hash']
-            )
-            
             async def download_range():
-                await client.connect()
+                client = TelegramClient(
+                    StringSession(credentials['telegram_session']),
+                    int(credentials['telegram_api_id']),
+                    credentials['telegram_api_hash']
+                )
                 
                 try:
+                    await client.connect()
+                    
                     # Get channel and message
                     channel = await client.get_entity(int(credentials['channel_id']))
                     message = await client.get_messages(channel, ids=int(message_id))
                     
-                    if not message:
-                        raise Exception(f"Message {message_id} not found")
+                    if not message or not message.file:
+                        raise Exception(f"Message {message_id} not found or has no file")
                     
                     # Get file size
-                    file_size = message.file.size if message.file else 0
+                    file_size = message.file.size
                     
                     # Adjust range_end if not specified or exceeds file size
-                    actual_end = min(range_end if range_end else file_size - 1, file_size - 1)
-                    
-                    # Download specific byte range
-                    chunks = []
+                    actual_end = min(range_end if range_end is not None else file_size - 1, file_size - 1)
                     bytes_to_download = actual_end - range_start + 1
-                    chunk_size = 512 * 1024  # 512KB chunks for smooth streaming
                     
-                    print(f"Downloading range {range_start}-{actual_end} ({bytes_to_download} bytes)")
+                    print(f"Downloading range {range_start}-{actual_end} ({bytes_to_download} bytes) from file size {file_size}")
                     
+                    # Stream chunks directly to queue
+                    chunk_size = 512 * 1024  # 512KB chunks
                     async for chunk in client.iter_download(
                         message.media,
                         offset=range_start,
                         limit=bytes_to_download,
                         chunk_size=chunk_size
                     ):
-                        chunks.append(chunk)
-                    
-                    return chunks, file_size, actual_end
+                        chunk_queue.put(chunk)  # Put chunk in queue immediately
                     
                 finally:
                     await client.disconnect()
             
-            # Download the range
-            chunks, file_size, actual_end = loop.run_until_complete(download_range())
+            loop.run_until_complete(download_range())
             
-            # Yield chunks
-            for chunk in chunks:
-                yield chunk
-                
         except Exception as e:
-            print(f"Range download error: {str(e)}")
+            error_holder['error'] = e
+            print(f"Async download error: {str(e)}")
             import traceback
             traceback.print_exc()
-            yield b''
-            
         finally:
-            if loop:
-                loop.close()
+            chunk_queue.put(None)  # Signal completion
+            loop.close()
+    
+    # Start async download in background thread
+    thread = threading.Thread(target=async_download_worker)
+    thread.daemon = True
+    thread.start()
+    
+    def generate():
+        """Generator that yields chunks from queue as they arrive"""
+        try:
+            while True:
+                # Get next chunk from queue (blocks until available)
+                chunk = chunk_queue.get(timeout=60)  # 60 second timeout per chunk
+                
+                if chunk is None:  # End signal
+                    break
+                
+                if error_holder['error']:
+                    raise error_holder['error']
+                
+                yield chunk
+                
+        except queue.Empty:
+            print("Queue timeout - no chunks received")
+            yield b''
+        except Exception as e:
+            print(f"Generator error: {str(e)}")
+            yield b''
     
     # Return partial content response (206)
     return Response(
@@ -531,52 +561,79 @@ def stream_file_range(message_id, credentials, file_name, range_start, range_end
 
 
 def stream_full_file(message_id, credentials, file_name):
-    """Stream entire file (for small files or legacy support)"""
-    def generate():
+    """Stream entire file using queue-based async bridge"""
+    
+    # Create queue for passing chunks
+    chunk_queue = queue.Queue(maxsize=10)
+    error_holder = {'error': None}
+    
+    def async_download_worker():
+        """Background thread for async download"""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        client = None
         
         try:
-            client = TelegramClient(
-                StringSession(credentials['telegram_session']),
-                int(credentials['telegram_api_id']),
-                credentials['telegram_api_hash']
-            )
-            
             async def download_full():
-                await client.connect()
+                client = TelegramClient(
+                    StringSession(credentials['telegram_session']),
+                    int(credentials['telegram_api_id']),
+                    credentials['telegram_api_hash']
+                )
                 
                 try:
+                    await client.connect()
+                    
                     channel = await client.get_entity(int(credentials['channel_id']))
                     message = await client.get_messages(channel, ids=int(message_id))
                     
-                    if not message:
-                        raise Exception(f"Message {message_id} not found")
+                    if not message or not message.file:
+                        raise Exception(f"Message {message_id} not found or has no file")
                     
-                    chunks = []
+                    print(f"Downloading full file: {file_name} ({message.file.size} bytes)")
+                    
+                    # Stream chunks to queue
                     async for chunk in client.iter_download(message.media, chunk_size=512 * 1024):
-                        chunks.append(chunk)
-                    
-                    return chunks
+                        chunk_queue.put(chunk)
                     
                 finally:
                     await client.disconnect()
             
-            chunks = loop.run_until_complete(download_full())
+            loop.run_until_complete(download_full())
             
-            for chunk in chunks:
-                yield chunk
-                
         except Exception as e:
-            print(f"Full download error: {str(e)}")
+            error_holder['error'] = e
+            print(f"Async download error: {str(e)}")
             import traceback
             traceback.print_exc()
-            yield b''
-            
         finally:
-            if loop:
-                loop.close()
+            chunk_queue.put(None)  # Signal completion
+            loop.close()
+    
+    # Start background download
+    thread = threading.Thread(target=async_download_worker)
+    thread.daemon = True
+    thread.start()
+    
+    def generate():
+        """Generator yields chunks from queue"""
+        try:
+            while True:
+                chunk = chunk_queue.get(timeout=60)
+                
+                if chunk is None:
+                    break
+                
+                if error_holder['error']:
+                    raise error_holder['error']
+                
+                yield chunk
+                
+        except queue.Empty:
+            print("Queue timeout")
+            yield b''
+        except Exception as e:
+            print(f"Generator error: {str(e)}")
+            yield b''
     
     return Response(
         stream_with_context(generate()),
