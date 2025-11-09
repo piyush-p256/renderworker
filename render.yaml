@@ -17,7 +17,7 @@ services:
     # Environment variables
     envVars:
       - key: BACKEND_URL
-        value: https://filedownload-chunked.preview.emergentagent.com  # Replace with your TeleStore backend URL
+        value: https://large-file-handler.preview.emergentagent.com  # Replace with your TeleStore backend URL
         sync: false
       
       # Optional: Python version
