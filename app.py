@@ -1,5 +1,6 @@
-from flask import Flask, request, jsonify, Response, stream_with_context
-from flask_cors import CORS
+from fastapi import FastAPI, Request, HTTPException, Form, File, UploadFile
+from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 import os
 import requests
 import hashlib
@@ -7,18 +8,32 @@ import json
 import time
 from datetime import datetime
 import threading
-import queue
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 import asyncio
 from collections import defaultdict
+from contextlib import asynccontextmanager
 
-app = Flask(__name__)
-CORS(app, origins='*', supports_credentials=True)
+# Lifespan for cleanup
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    # Cleanup on shutdown if needed
+
+app = FastAPI(lifespan=lifespan)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Configuration
 CONFIG = {
-    'BACKEND_URL': os.environ.get('BACKEND_URL', 'https://chunked-file-fix.preview.emergentagent.com'),
+    'BACKEND_URL': os.environ.get('BACKEND_URL', 'https://filedownload-chunked.preview.emergentagent.com'),
     'MAX_CHUNK_SIZE': 50 * 1024 * 1024,  # 50MB per chunk
     'UPLOAD_DIR': '/tmp/uploads',
     'BOT_API_SIZE_LIMIT': 50 * 1024 * 1024,  # 50MB - use Bot API up to 50MB
@@ -64,40 +79,36 @@ def get_credentials(auth_token):
         return None
 
 
-@app.route('/health', methods=['GET'])
-def health_check():
+@app.get('/health')
+async def health_check():
     """Health check endpoint"""
-    return jsonify({"status": "ok", "timestamp": datetime.now().isoformat()})
+    return {"status": "ok", "timestamp": datetime.now().isoformat()}
 
 
-@app.route('/upload', methods=['POST'])
-def upload_file():
+@app.post('/upload')
+async def upload_file(
+    authToken: str = Form(...),
+    file: UploadFile = File(...)
+):
     """Handle file upload - stores file temporarily and returns upload ID"""
     try:
-        # Get auth token
-        auth_token = request.form.get('authToken')
-        if not auth_token:
-            return jsonify({'error': 'Missing auth token'}), 401
-        
         # Get credentials
-        credentials = get_credentials(auth_token)
+        credentials = get_credentials(authToken)
         if not credentials:
-            return jsonify({'error': 'Failed to fetch credentials'}), 401
+            raise HTTPException(status_code=401, detail='Failed to fetch credentials')
         
-        # Get uploaded file
-        if 'file' not in request.files:
-            return jsonify({'error': 'No file provided'}), 400
-        
-        file = request.files['file']
-        if file.filename == '':
-            return jsonify({'error': 'Empty filename'}), 400
+        if not file.filename:
+            raise HTTPException(status_code=400, detail='Empty filename')
         
         # Generate upload ID
-        upload_id = hashlib.md5(f"{auth_token}{file.filename}{time.time()}".encode()).hexdigest()
+        upload_id = hashlib.md5(f"{authToken}{file.filename}{time.time()}".encode()).hexdigest()
         file_path = os.path.join(CONFIG['UPLOAD_DIR'], upload_id)
         
         # Save file
-        file.save(file_path)
+        with open(file_path, 'wb') as buffer:
+            content = await file.read()
+            buffer.write(content)
+        
         file_size = os.path.getsize(file_path)
         
         # Initialize upload progress
@@ -113,39 +124,41 @@ def upload_file():
             'error': None
         }
         
-        return jsonify({
+        return {
             'uploadId': upload_id,
             'size': file_size
-        })
+        }
         
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Upload error: {str(e)}")
         import traceback
         traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.route('/complete-upload', methods=['POST'])
-def complete_upload():
+@app.post('/complete-upload')
+async def complete_upload(request: Request):
     """Complete the upload by sending to Telegram in background"""
     try:
-        data = request.get_json()
+        data = await request.json()
         upload_id = data.get('uploadId')
         
         if not upload_id or upload_id not in upload_progress:
-            return jsonify({'error': 'Invalid upload ID'}), 400
+            raise HTTPException(status_code=400, detail='Invalid upload ID')
         
         progress = upload_progress[upload_id]
         
         if progress['status'] == 'uploading':
-            return jsonify({'error': 'Upload already in progress'}), 400
+            raise HTTPException(status_code=400, detail='Upload already in progress')
         
         if progress['status'] == 'completed':
-            return jsonify({
+            return {
                 'status': 'completed',
                 'messageId': progress['message_id'],
                 'fileId': progress['file_id']
-            })
+            }
         
         # Start upload in background thread
         progress['status'] = 'uploading'
@@ -159,17 +172,19 @@ def complete_upload():
         thread.start()
         
         # Return immediately
-        return jsonify({
+        return {
             'status': 'uploading',
             'uploadId': upload_id,
             'message': 'Upload to Telegram started in background'
-        })
+        }
         
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Complete upload error: {str(e)}")
         import traceback
         traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 def upload_to_telegram_background(upload_id):
@@ -367,38 +382,36 @@ async def upload_to_telegram_client(file_path, file_name, credentials, upload_id
             print("Telethon client disconnected")
 
 
-@app.route('/upload-progress/<upload_id>', methods=['GET'])
-def get_upload_progress(upload_id):
+@app.get('/upload-progress/{upload_id}')
+async def get_upload_progress(upload_id: str):
     """Get upload progress for a specific upload ID"""
     try:
         if upload_id not in upload_progress:
-            return jsonify({'error': 'Upload ID not found'}), 404
+            raise HTTPException(status_code=404, detail='Upload ID not found')
         
         progress = upload_progress[upload_id]
         
-        return jsonify({
+        return {
             'status': progress['status'],
             'telegram_progress': progress['telegram_progress'],
             'message_id': progress['message_id'],
             'file_id': progress['file_id'],
             'error': progress['error']
-        })
+        }
         
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Progress check error: {str(e)}")
-        return jsonify({'error': str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.route('/download', methods=['GET'])
-def download_file():
+@app.get('/download')
+async def download_file(request: Request, messageId: str, token: str, fileName: str = 'file'):
     """Download files from Telegram with Range request support for chunked downloads"""
     try:
-        message_id = request.args.get('messageId')
-        token = request.args.get('token')
-        file_name = request.args.get('fileName', 'file')
-        
-        if not message_id or not token:
-            return jsonify({'error': 'Missing messageId or token'}), 400
+        if not messageId or not token:
+            raise HTTPException(status_code=400, detail='Missing messageId or token')
         
         # Verify token with backend
         try:
@@ -409,12 +422,14 @@ def download_file():
             )
             
             if verify_response.status_code != 200:
-                return jsonify({'error': 'Invalid or expired token'}), 401
+                raise HTTPException(status_code=401, detail='Invalid or expired token')
             
             credentials = verify_response.json()
+        except HTTPException:
+            raise
         except Exception as e:
             print(f"Token verification failed: {str(e)}")
-            return jsonify({'error': 'Failed to verify token'}), 401
+            raise HTTPException(status_code=401, detail='Failed to verify token')
         
         # Get Range header if present
         range_header = request.headers.get('Range')
@@ -432,125 +447,101 @@ def download_file():
                     range_end = None
             except Exception as e:
                 print(f"Error parsing Range header '{range_header}': {e}")
-                return jsonify({'error': 'Invalid Range header'}), 416
+                raise HTTPException(status_code=416, detail='Invalid Range header')
             
             print(f"Range request: {range_start}-{range_end}")
             
             # Stream specific byte range from Telegram
-            return stream_file_range(
-                message_id, 
+            return await stream_file_range(
+                request,
+                messageId, 
                 credentials, 
-                file_name, 
+                fileName, 
                 range_start, 
                 range_end
             )
         else:
             # Full file download (for small files or legacy support)
-            print(f"Full file download request: {file_name}")
-            return stream_full_file(message_id, credentials, file_name)
+            print(f"Full file download request: {fileName}")
+            return await stream_full_file(request, messageId, credentials, fileName)
         
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Download error: {str(e)}")
         import traceback
         traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-def stream_file_range(message_id, credentials, file_name, range_start, range_end):
-    """Stream a specific byte range from Telegram file using queue-based async bridge"""
+async def stream_file_range(request: Request, message_id, credentials, file_name, range_start, range_end):
+    """Stream a specific byte range from Telegram file using pure async generator"""
     
-    # Create queue for passing chunks from async thread to sync generator
-    chunk_queue = queue.Queue(maxsize=10)  # Buffer up to 10 chunks
-    error_holder = {'error': None}
-    
-    def async_download_worker():
-        """Background thread that runs async download and puts chunks in queue"""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
+    async def generate_chunks():
+        """Async generator that yields chunks from Telegram"""
+        client = None
         try:
-            async def download_range():
-                client = TelegramClient(
-                    StringSession(credentials['telegram_session']),
-                    int(credentials['telegram_api_id']),
-                    credentials['telegram_api_hash']
-                )
-                
-                try:
-                    await client.connect()
-                    
-                    # Get channel and message
-                    channel = await client.get_entity(int(credentials['channel_id']))
-                    message = await client.get_messages(channel, ids=int(message_id))
-                    
-                    if not message or not message.file:
-                        raise Exception(f"Message {message_id} not found or has no file")
-                    
-                    # Get file size
-                    file_size = message.file.size
-                    
-                    # Adjust range_end if not specified or exceeds file size
-                    actual_end = min(range_end if range_end is not None else file_size - 1, file_size - 1)
-                    bytes_to_download = actual_end - range_start + 1
-                    
-                    print(f"Downloading range {range_start}-{actual_end} ({bytes_to_download} bytes) from file size {file_size}")
-                    
-                    # Stream chunks directly to queue
-                    chunk_size = 512 * 1024  # 512KB chunks
-                    async for chunk in client.iter_download(
-                        message.media,
-                        offset=range_start,
-                        limit=bytes_to_download,
-                        chunk_size=chunk_size
-                    ):
-                        chunk_queue.put(chunk)  # Put chunk in queue immediately
-                    
-                finally:
-                    await client.disconnect()
+            client = TelegramClient(
+                StringSession(credentials['telegram_session']),
+                int(credentials['telegram_api_id']),
+                credentials['telegram_api_hash']
+            )
             
-            loop.run_until_complete(download_range())
+            await client.connect()
             
-        except Exception as e:
-            error_holder['error'] = e
-            print(f"Async download error: {str(e)}")
-            import traceback
-            traceback.print_exc()
-        finally:
-            chunk_queue.put(None)  # Signal completion
-            loop.close()
-    
-    # Start async download in background thread
-    thread = threading.Thread(target=async_download_worker)
-    thread.daemon = True
-    thread.start()
-    
-    def generate():
-        """Generator that yields chunks from queue as they arrive"""
-        try:
-            while True:
-                # Get next chunk from queue (blocks until available)
-                chunk = chunk_queue.get(timeout=60)  # 60 second timeout per chunk
-                
-                if chunk is None:  # End signal
+            # Get channel and message
+            channel = await client.get_entity(int(credentials['channel_id']))
+            message = await client.get_messages(channel, ids=int(message_id))
+            
+            if not message or not message.file:
+                raise Exception(f"Message {message_id} not found or has no file")
+            
+            # Get file size
+            file_size = message.file.size
+            
+            # Adjust range_end if not specified or exceeds file size
+            actual_end = min(range_end if range_end is not None else file_size - 1, file_size - 1)
+            bytes_to_download = actual_end - range_start + 1
+            
+            print(f"Downloading range {range_start}-{actual_end} ({bytes_to_download} bytes) from file size {file_size}")
+            
+            # Stream chunks with larger chunk size (1MB) for efficiency
+            chunk_size = 1024 * 1024  # 1MB chunks (increased from 512KB)
+            downloaded = 0
+            
+            async for chunk in client.iter_download(
+                message.media,
+                offset=range_start,
+                limit=bytes_to_download,
+                chunk_size=chunk_size
+            ):
+                # Check if client disconnected
+                if await request.is_disconnected():
+                    print(f"Client disconnected during download, stopping...")
                     break
                 
-                if error_holder['error']:
-                    raise error_holder['error']
+                downloaded += len(chunk)
+                if downloaded % (5 * 1024 * 1024) == 0:  # Log every 5MB
+                    print(f"Downloaded: {downloaded}/{bytes_to_download} bytes")
                 
                 yield chunk
+            
+            print(f"Download complete: {downloaded} bytes")
                 
-        except queue.Empty:
-            print("Queue timeout - no chunks received")
-            yield b''
         except Exception as e:
-            print(f"Generator error: {str(e)}")
-            yield b''
+            print(f"Streaming error: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            raise
+        finally:
+            if client:
+                await client.disconnect()
     
-    # Return partial content response (206)
-    return Response(
-        stream_with_context(generate()),
-        status=206,
-        mimetype='application/octet-stream',
+    # Return partial content response (206) with StreamingResponse
+    return StreamingResponse(
+        generate_chunks(),
+        status_code=206,
+        media_type='application/octet-stream',
         headers={
             'Content-Disposition': f'attachment; filename="{file_name}"',
             'Accept-Ranges': 'bytes',
@@ -560,84 +551,57 @@ def stream_file_range(message_id, credentials, file_name, range_start, range_end
     )
 
 
-def stream_full_file(message_id, credentials, file_name):
-    """Stream entire file using queue-based async bridge"""
+async def stream_full_file(request: Request, message_id, credentials, file_name):
+    """Stream entire file using pure async generator"""
     
-    # Create queue for passing chunks
-    chunk_queue = queue.Queue(maxsize=10)
-    error_holder = {'error': None}
-    
-    def async_download_worker():
-        """Background thread for async download"""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
+    async def generate_chunks():
+        """Async generator for full file download"""
+        client = None
         try:
-            async def download_full():
-                client = TelegramClient(
-                    StringSession(credentials['telegram_session']),
-                    int(credentials['telegram_api_id']),
-                    credentials['telegram_api_hash']
-                )
-                
-                try:
-                    await client.connect()
-                    
-                    channel = await client.get_entity(int(credentials['channel_id']))
-                    message = await client.get_messages(channel, ids=int(message_id))
-                    
-                    if not message or not message.file:
-                        raise Exception(f"Message {message_id} not found or has no file")
-                    
-                    print(f"Downloading full file: {file_name} ({message.file.size} bytes)")
-                    
-                    # Stream chunks to queue
-                    async for chunk in client.iter_download(message.media, chunk_size=512 * 1024):
-                        chunk_queue.put(chunk)
-                    
-                finally:
-                    await client.disconnect()
+            client = TelegramClient(
+                StringSession(credentials['telegram_session']),
+                int(credentials['telegram_api_id']),
+                credentials['telegram_api_hash']
+            )
             
-            loop.run_until_complete(download_full())
+            await client.connect()
             
-        except Exception as e:
-            error_holder['error'] = e
-            print(f"Async download error: {str(e)}")
-            import traceback
-            traceback.print_exc()
-        finally:
-            chunk_queue.put(None)  # Signal completion
-            loop.close()
-    
-    # Start background download
-    thread = threading.Thread(target=async_download_worker)
-    thread.daemon = True
-    thread.start()
-    
-    def generate():
-        """Generator yields chunks from queue"""
-        try:
-            while True:
-                chunk = chunk_queue.get(timeout=60)
-                
-                if chunk is None:
+            channel = await client.get_entity(int(credentials['channel_id']))
+            message = await client.get_messages(channel, ids=int(message_id))
+            
+            if not message or not message.file:
+                raise Exception(f"Message {message_id} not found or has no file")
+            
+            print(f"Downloading full file: {file_name} ({message.file.size} bytes)")
+            
+            # Stream chunks with 1MB size
+            downloaded = 0
+            async for chunk in client.iter_download(message.media, chunk_size=1024 * 1024):
+                # Check if client disconnected
+                if await request.is_disconnected():
+                    print(f"Client disconnected during download, stopping...")
                     break
                 
-                if error_holder['error']:
-                    raise error_holder['error']
+                downloaded += len(chunk)
+                if downloaded % (10 * 1024 * 1024) == 0:  # Log every 10MB
+                    print(f"Downloaded: {downloaded}/{message.file.size} bytes")
                 
                 yield chunk
+            
+            print(f"Full download complete: {downloaded} bytes")
                 
-        except queue.Empty:
-            print("Queue timeout")
-            yield b''
         except Exception as e:
-            print(f"Generator error: {str(e)}")
-            yield b''
+            print(f"Streaming error: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            raise
+        finally:
+            if client:
+                await client.disconnect()
     
-    return Response(
-        stream_with_context(generate()),
-        mimetype='application/octet-stream',
+    return StreamingResponse(
+        generate_chunks(),
+        media_type='application/octet-stream',
         headers={
             'Content-Disposition': f'attachment; filename="{file_name}"',
             'Accept-Ranges': 'bytes',
