@@ -9,14 +9,14 @@ bind = f"0.0.0.0:{os.environ.get('PORT', '10000')}"
 
 # Worker processes
 workers = 2
-worker_class = 'sync'
+worker_class = 'uvicorn.workers.UvicornWorker'  # Use Uvicorn worker for async support
 threads = 1
 
 # Timeout settings
-# Reasonable timeout since uploads happen in background threads
-# Requests return immediately and don't block the worker
-timeout = 120  # 2 minutes (enough for chunk merging)
-graceful_timeout = 60
+# With async streaming, workers don't timeout during downloads
+# The async generator yields chunks without blocking
+timeout = 600  # 10 minutes (generous timeout, but shouldn't hit it with async)
+graceful_timeout = 120
 keepalive = 5
 
 # Logging
