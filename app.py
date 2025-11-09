@@ -29,7 +29,7 @@ CORS(app, resources={
 
 # Configuration - only set BACKEND_URL, credentials will be fetched automatically
 CONFIG = {
-    'BACKEND_URL': os.environ.get('BACKEND_URL', 'https://synced-progress-view.preview.emergentagent.com'),
+    'BACKEND_URL': os.environ.get('BACKEND_URL', 'https://bigload-solver.preview.emergentagent.com'),
     'MAX_FILE_SIZE': 2000 * 1024 * 1024,  # 2GB
     'CHUNK_SIZE': 5 * 1024 * 1024,  # 5MB chunks (safe for Render free tier 10MB limit)
     'CACHE_DURATION': 3600,  # 1 hour in seconds
@@ -586,6 +586,104 @@ def cancel_upload():
         return jsonify({'success': True, 'message': 'Upload cancelled'})
         
     except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/download', methods=['GET'])
+def download_file():
+    """Download large files from Telegram using Telethon streaming"""
+    try:
+        message_id = request.args.get('messageId')
+        token = request.args.get('token')
+        file_name = request.args.get('fileName', 'file')
+        
+        if not message_id or not token:
+            return jsonify({'error': 'Missing messageId or token'}), 400
+        
+        # Verify token with backend
+        try:
+            verify_response = requests.post(
+                f"{CONFIG['BACKEND_URL']}/api/worker/verify-download-token",
+                data={'token': token},
+                timeout=10
+            )
+            
+            if verify_response.status_code != 200:
+                return jsonify({'error': 'Invalid or expired token'}), 401
+            
+            credentials = verify_response.json()
+        except Exception as e:
+            print(f"Token verification failed: {str(e)}")
+            return jsonify({'error': 'Failed to verify token'}), 401
+        
+        # Stream file from Telegram using Telethon
+        def generate_file_stream():
+            """Generator function to stream file in chunks"""
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                # Initialize Telethon client
+                client = TelegramClient(
+                    StringSession(credentials['telegram_session']),
+                    int(credentials['telegram_api_id']),
+                    credentials['telegram_api_hash']
+                )
+                
+                async def download_and_stream():
+                    chunks = []
+                    await client.connect()
+                    
+                    try:
+                        # Get the channel entity
+                        channel = await client.get_entity(int(credentials['channel_id']))
+                        
+                        # Download file in chunks
+                        chunk_size = 1024 * 1024  # 1MB chunks
+                        async for chunk in client.iter_download(
+                            channel,
+                            int(message_id),
+                            chunk_size=chunk_size
+                        ):
+                            chunks.append(chunk)
+                    
+                    finally:
+                        await client.disconnect()
+                    
+                    return chunks
+                
+                # Run the async download and get all chunks
+                chunks = loop.run_until_complete(download_and_stream())
+                
+                # Yield chunks synchronously
+                for chunk in chunks:
+                    yield chunk
+            
+            except Exception as e:
+                print(f"Download streaming error: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                # Yield empty on error
+                yield b''
+            
+            finally:
+                loop.close()
+        
+        # Return streaming response
+        from flask import Response
+        return Response(
+            generate_file_stream(),
+            mimetype='application/octet-stream',
+            headers={
+                'Content-Disposition': f'attachment; filename="{file_name}"',
+                'Cache-Control': 'no-cache',
+                'X-Accel-Buffering': 'no'  # Disable nginx buffering
+            }
+        )
+        
+    except Exception as e:
+        print(f"Download error: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 # Legacy endpoint for small files (backwards compatibility)
