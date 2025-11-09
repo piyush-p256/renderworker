@@ -1,14 +1,33 @@
+# Render.com deployment configuration for TeleStore Worker
+# This configuration is optimized for large file uploads (up to 2GB)
+
 services:
   - type: web
     name: telestore-worker
     env: python
     runtime: python
-    plan: free  # Works on Render Free Tier
+    plan: free  # or upgrade to 'starter' for better performance
+    
+    # Build settings
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn -c gunicorn_config.py render-chunk:app
+    
+    # Start command with gunicorn config for large file timeouts
+    startCommand: gunicorn -c gunicorn_config.py render-service-chunked:app
+    
+    # Environment variables
     envVars:
       - key: BACKEND_URL
-        value: https://chunked-tg-upload.preview.emergentagent.com
+        value: https://chunked-tg-upload.preview.emergentagent.com  # Replace with your TeleStore backend URL
+        sync: false
+      
+      # Optional: Python version
       - key: PYTHON_VERSION
         value: 3.11.0
+        sync: false
+    
+    # Health check endpoint
     healthCheckPath: /
+    
+    # Autoscaling (optional, requires paid plan)
+    # autoDeploy: true
+    # numInstances: 1
