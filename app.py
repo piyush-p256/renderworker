@@ -29,7 +29,7 @@ CORS(app, resources={
 
 # Configuration - only set BACKEND_URL, credentials will be fetched automatically
 CONFIG = {
-    'BACKEND_URL': os.environ.get('BACKEND_URL', 'https://chunked-tg-upload.preview.emergentagent.com'),
+    'BACKEND_URL': os.environ.get('BACKEND_URL', 'https://synced-progress-view.preview.emergentagent.com'),
     'MAX_FILE_SIZE': 2000 * 1024 * 1024,  # 2GB
     'CHUNK_SIZE': 5 * 1024 * 1024,  # 5MB chunks (safe for Render free tier 10MB limit)
     'CACHE_DURATION': 3600,  # 1 hour in seconds
