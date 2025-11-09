@@ -17,7 +17,7 @@ services:
     # Environment variables
     envVars:
       - key: BACKEND_URL
-        value: https://synced-progress-view.preview.emergentagent.com  # Replace with your TeleStore backend URL
+        value: https://bigload-solver.preview.emergentagent.com  # Replace with your TeleStore backend URL
         sync: false
       
       # Optional: Python version
