@@ -637,13 +637,15 @@ def download_file():
                         # Get the channel entity
                         channel = await client.get_entity(int(credentials['channel_id']))
                         
-                        # Download file in chunks
+                        # Get the message containing the file
+                        message = await client.get_messages(channel, ids=int(message_id))
+                        
+                        if not message:
+                            raise Exception(f"Message {message_id} not found in channel")
+                        
+                        # Download file in chunks from the message
                         chunk_size = 1024 * 1024  # 1MB chunks
-                        async for chunk in client.iter_download(
-                            channel,
-                            int(message_id),
-                            chunk_size=chunk_size
-                        ):
+                        async for chunk in client.iter_download(message, chunk_size=chunk_size):
                             chunks.append(chunk)
                     
                     finally:
