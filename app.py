@@ -13,6 +13,7 @@ from telethon.sessions import StringSession
 import asyncio
 from collections import defaultdict
 from contextlib import asynccontextmanager
+import mimetypes
 
 # Lifespan for cleanup
 @asynccontextmanager
@@ -48,6 +49,15 @@ upload_locks = defaultdict(threading.Lock)
 os.makedirs(CONFIG['UPLOAD_DIR'], exist_ok=True)
 
 print(f"Worker started with BACKEND_URL: {CONFIG['BACKEND_URL']}")
+
+
+def get_mime_type(filename):
+    """Get MIME type from filename"""
+    mime_type, _ = mimetypes.guess_type(filename)
+    if mime_type:
+        return mime_type
+    # Default to octet-stream if unknown
+    return 'application/octet-stream'
 
 
 def get_credentials(auth_token):
@@ -477,82 +487,108 @@ async def download_file(request: Request, messageId: str, token: str, fileName: 
 async def stream_file_range(request: Request, message_id, credentials, file_name, range_start, range_end):
     """Stream a specific byte range from Telegram file using pure async generator"""
     
-    async def generate_chunks():
-        """Async generator that yields chunks from Telegram"""
-        client = None
-        try:
-            client = TelegramClient(
-                StringSession(credentials['telegram_session']),
-                int(credentials['telegram_api_id']),
-                credentials['telegram_api_hash']
-            )
-            
-            await client.connect()
-            
-            # Get channel and message
-            channel = await client.get_entity(int(credentials['channel_id']))
-            message = await client.get_messages(channel, ids=int(message_id))
-            
-            if not message or not message.file:
-                raise Exception(f"Message {message_id} not found or has no file")
-            
-            # Get file size
-            file_size = message.file.size
-            
-            # Adjust range_end if not specified or exceeds file size
-            actual_end = min(range_end if range_end is not None else file_size - 1, file_size - 1)
-            bytes_to_download = actual_end - range_start + 1
-            
-            print(f"Downloading range {range_start}-{actual_end} ({bytes_to_download} bytes) from file size {file_size}")
-            
-            # Stream chunks with larger chunk size (1MB) for efficiency
-            chunk_size = 1024 * 1024  # 1MB chunks (increased from 512KB)
-            downloaded = 0
-            
-            async for chunk in client.iter_download(
-                message.media,
-                offset=range_start,
-                limit=bytes_to_download,
-                chunk_size=chunk_size
-            ):
-                # Check if client disconnected
-                if await request.is_disconnected():
-                    print(f"Client disconnected during download, stopping...")
-                    break
-                
-                downloaded += len(chunk)
-                if downloaded % (5 * 1024 * 1024) == 0:  # Log every 5MB
-                    print(f"Downloaded: {downloaded}/{bytes_to_download} bytes")
-                
-                yield chunk
-            
-            print(f"Download complete: {downloaded} bytes")
-                
-        except Exception as e:
-            print(f"Streaming error: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            raise
-        finally:
-            if client:
-                await client.disconnect()
-    
-    # Return partial content response (206) with StreamingResponse
-    return StreamingResponse(
-        generate_chunks(),
-        status_code=206,
-        media_type='application/octet-stream',
-        headers={
-            'Content-Disposition': f'attachment; filename="{file_name}"',
-            'Accept-Ranges': 'bytes',
-            'Cache-Control': 'no-cache',
-            'X-Accel-Buffering': 'no'
-        }
+    # Get file size first for headers - single connection approach
+    client = TelegramClient(
+        StringSession(credentials['telegram_session']),
+        int(credentials['telegram_api_id']),
+        credentials['telegram_api_hash']
     )
+    
+    try:
+        await client.connect()
+        channel = await client.get_entity(int(credentials['channel_id']))
+        message = await client.get_messages(channel, ids=int(message_id))
+        
+        if not message or not message.file:
+            raise Exception(f"Message {message_id} not found or has no file")
+        
+        file_size = message.file.size
+        
+        # Adjust range_end if not specified or exceeds file size
+        actual_end = min(range_end if range_end is not None else file_size - 1, file_size - 1)
+        bytes_to_send = actual_end - range_start + 1
+        
+        print(f"Streaming range {range_start}-{actual_end} ({bytes_to_send} bytes) from file size {file_size}")
+        
+        # Create async generator for streaming
+        async def generate_chunks():
+            """Async generator that yields chunks from Telegram"""
+            try:
+                # Stream chunks with 1MB chunk size for efficiency
+                chunk_size = 1024 * 1024  # 1MB chunks
+                downloaded = 0
+                
+                async for chunk in client.iter_download(
+                    message.media,
+                    offset=range_start,
+                    limit=bytes_to_send,
+                    chunk_size=chunk_size
+                ):
+                    # Check if client disconnected
+                    if await request.is_disconnected():
+                        print(f"Client disconnected during download, stopping...")
+                        break
+                    
+                    downloaded += len(chunk)
+                    if downloaded % (5 * 1024 * 1024) == 0:  # Log every 5MB
+                        print(f"Streamed: {downloaded}/{bytes_to_send} bytes")
+                    
+                    yield chunk
+                
+                print(f"Range streaming complete: {downloaded} bytes")
+                    
+            except Exception as e:
+                print(f"Streaming error: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                raise
+            finally:
+                # Disconnect after streaming is complete
+                await client.disconnect()
+        
+        # Detect MIME type from filename
+        mime_type = get_mime_type(file_name)
+        
+        # Return partial content response (206) with proper headers
+        return StreamingResponse(
+            generate_chunks(),
+            status_code=206,
+            media_type=mime_type,
+            headers={
+                'Content-Disposition': f'inline; filename="{file_name}"',  # inline for browser playback
+                'Accept-Ranges': 'bytes',
+                'Content-Range': f'bytes {range_start}-{actual_end}/{file_size}',
+                'Content-Length': str(bytes_to_send),
+                'Cache-Control': 'no-cache',
+                'X-Accel-Buffering': 'no'
+            }
+        )
+    except Exception as e:
+        # Ensure we disconnect on error
+        if client:
+            await client.disconnect()
+        raise
 
 
 async def stream_full_file(request: Request, message_id, credentials, file_name):
     """Stream entire file using pure async generator"""
+    
+    # Get file size first for Content-Length header
+    client_temp = TelegramClient(
+        StringSession(credentials['telegram_session']),
+        int(credentials['telegram_api_id']),
+        credentials['telegram_api_hash']
+    )
+    await client_temp.connect()
+    channel_temp = await client_temp.get_entity(int(credentials['channel_id']))
+    message_temp = await client_temp.get_messages(channel_temp, ids=int(message_id))
+    
+    if not message_temp or not message_temp.file:
+        await client_temp.disconnect()
+        raise Exception(f"Message {message_id} not found or has no file")
+    
+    file_size = message_temp.file.size
+    await client_temp.disconnect()
     
     async def generate_chunks():
         """Async generator for full file download"""
@@ -599,12 +635,16 @@ async def stream_full_file(request: Request, message_id, credentials, file_name)
             if client:
                 await client.disconnect()
     
+    # Detect MIME type from filename
+    mime_type = get_mime_type(file_name)
+    
     return StreamingResponse(
         generate_chunks(),
-        media_type='application/octet-stream',
+        media_type=mime_type,
         headers={
-            'Content-Disposition': f'attachment; filename="{file_name}"',
+            'Content-Disposition': f'inline; filename="{file_name}"',  # inline for browser playback
             'Accept-Ranges': 'bytes',
+            'Content-Length': str(file_size),
             'Cache-Control': 'no-cache',
             'X-Accel-Buffering': 'no'
         }
