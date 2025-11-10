@@ -17,7 +17,7 @@ services:
     # Environment variables
     envVars:
       - key: BACKEND_URL
-        value: https://pdf-render-repair-2.preview.emergentagent.com  # Replace with your TeleStore backend URL
+        value: https://face-catalog-app.preview.emergentagent.com  # Replace with your TeleStore backend URL
         sync: false
       
       # Optional: Python version
