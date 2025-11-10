@@ -17,7 +17,7 @@ services:
     # Environment variables
     envVars:
       - key: BACKEND_URL
-        value: https://buffer-playback-fix.preview.emergentagent.com  # Replace with your TeleStore backend URL
+        value: https://full-stack-run.preview.emergentagent.com  # Replace with your TeleStore backend URL
         sync: false
       
       # Optional: Python version
