@@ -5,3 +5,5 @@ Werkzeug
 gunicorn
 telethon
 cryptg
+uvicorn[standard]
+python-multipart
