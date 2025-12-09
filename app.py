@@ -102,7 +102,7 @@ async def upload_file(
     authToken: str = Form(...),
     file: UploadFile = File(...)
 ):
-    """Handle legacy single-file upload"""
+    """Handle legacy single-file upload but with async Telegram upload"""
     try:
         # Get credentials
         credentials = get_credentials(authToken)
@@ -125,7 +125,7 @@ async def upload_file(
         
         # Initialize upload progress
         upload_progress[upload_id] = {
-            'status': 'uploaded',
+            'status': 'uploading', # Start as uploading immediately
             'file_path': file_path,
             'file_size': file_size,
             'file_name': file.filename,
@@ -136,8 +136,18 @@ async def upload_file(
             'error': None
         }
         
+        # Start upload in background thread
+        thread = threading.Thread(
+            target=upload_to_telegram_background,
+            args=(upload_id,)
+        )
+        thread.daemon = True
+        thread.start()
+        
         return {
+            'success': True,
             'uploadId': upload_id,
+            'status': 'uploading',
             'size': file_size
         }
         
@@ -271,6 +281,7 @@ async def complete_upload(request: Request):
         upload_id = data.get('uploadId')
         
         if not upload_id or upload_id not in upload_progress:
+            print(f"Complete upload failed: Invalid upload ID {upload_id} (Available: {list(upload_progress.keys())})")
             raise HTTPException(status_code=400, detail='Invalid upload ID')
         
         progress = upload_progress[upload_id]
@@ -286,6 +297,7 @@ async def complete_upload(request: Request):
             received_chunks = progress.get('received_chunks', set())
             
             if len(received_chunks) < total_chunks:
+                print(f"Complete upload failed: Incomplete chunks for {upload_id} ({len(received_chunks)}/{total_chunks})")
                 raise HTTPException(status_code=400, detail=f"Incomplete upload: {len(received_chunks)}/{total_chunks} chunks")
             
             # Assemble file
@@ -324,6 +336,7 @@ async def complete_upload(request: Request):
                 'fileId': progress['file_id']
             }
         elif progress.get('status') == 'uploading':
+             print(f"Complete upload failed: Upload already in progress for {upload_id}")
              raise HTTPException(status_code=400, detail='Upload to Telegram already in progress')
         
         # Start upload in background thread
@@ -567,8 +580,8 @@ async def get_upload_progress(upload_id: str):
         return {
             'status': progress.get('status'),
             'telegram_progress': progress.get('telegram_progress', 0),
-            'message_id': progress.get('message_id'),
-            'file_id': progress.get('file_id'),
+            'messageId': progress.get('message_id'),
+            'fileId': progress.get('file_id'),
             'error': progress.get('error')
         }
         
