@@ -34,7 +34,7 @@ app.add_middleware(
 
 # Configuration
 CONFIG = {
-    'BACKEND_URL': os.environ.get('BACKEND_URL', 'https://teledrive-wvtv.onrender.com'),
+    'BACKEND_URL': os.environ.get('BACKEND_URL', 'https://894728515923.ngrok-free.app'),
     'MAX_CHUNK_SIZE': 50 * 1024 * 1024,  # 50MB per chunk
     'UPLOAD_DIR': '/tmp/uploads',
     'BOT_API_SIZE_LIMIT': 50 * 1024 * 1024,  # 50MB - use Bot API up to 50MB
