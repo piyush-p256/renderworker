@@ -5,10 +5,3 @@ gunicorn
 telethon
 cryptg
 python-multipart
-opencv-python-headless
-Pillow
-transformers
-torch
-nltk
-numpy
-deepface
