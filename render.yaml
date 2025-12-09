@@ -17,7 +17,7 @@ services:
     # Environment variables
     envVars:
       - key: BACKEND_URL
-        value: https://teledrive-wvtv.onrender.com  # Replace with your TeleStore backend URL
+        value: https://894728515923.ngrok-free.app  # Replace with your TeleStore backend URL
         sync: false
       
       # Optional: Python version
