@@ -1,7 +1,7 @@
-fastapi
-uvicorn[standard]
+Flask
+Flask-Cors
 requests
+Werkzeug
 gunicorn
 telethon
 cryptg
-python-multipart
