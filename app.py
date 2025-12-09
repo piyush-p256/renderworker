@@ -14,16 +14,6 @@ import asyncio
 from collections import defaultdict
 from contextlib import asynccontextmanager
 import mimetypes
-import cv2
-import numpy as np
-from PIL import Image
-import io
-import base64
-from transformers import BlipProcessor, BlipForConditionalGeneration
-from deepface import DeepFace
-import nltk
-from nltk.corpus import stopwords
-from nltk.tokenize import word_tokenize
 
 # Lifespan for cleanup
 @asynccontextmanager
@@ -44,7 +34,7 @@ app.add_middleware(
 
 # Configuration
 CONFIG = {
-    'BACKEND_URL': os.environ.get('BACKEND_URL', 'https://photo-analyzer-16.preview.emergentagent.com'),
+    'BACKEND_URL': os.environ.get('BACKEND_URL', 'https://teledrive-wvtv.onrender.com'),
     'MAX_CHUNK_SIZE': 50 * 1024 * 1024,  # 50MB per chunk
     'UPLOAD_DIR': '/tmp/uploads',
     'BOT_API_SIZE_LIMIT': 50 * 1024 * 1024,  # 50MB - use Bot API up to 50MB
@@ -59,32 +49,6 @@ upload_locks = defaultdict(threading.Lock)
 os.makedirs(CONFIG['UPLOAD_DIR'], exist_ok=True)
 
 print(f"Worker started with BACKEND_URL: {CONFIG['BACKEND_URL']}")
-
-# Download NLTK stopwords on startup
-try:
-    nltk.download('stopwords', quiet=True)
-    nltk.download('punkt', quiet=True)
-    print("NLTK resources downloaded")
-except Exception as e:
-    print(f"Warning: NLTK download failed: {e}")
-
-# Load BLIP model globally (will be loaded on first use to save startup time)
-blip_processor = None
-blip_model = None
-
-def load_blip_model():
-    """Load BLIP model for image captioning - lazy loading"""
-    global blip_processor, blip_model
-    if blip_processor is None or blip_model is None:
-        print("Loading BLIP model for image description...")
-        try:
-            blip_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-            blip_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
-            print("BLIP model loaded successfully")
-        except Exception as e:
-            print(f"Failed to load BLIP model: {e}")
-            raise
-    return blip_processor, blip_model
 
 
 def get_mime_type(filename):
@@ -123,248 +87,6 @@ def get_credentials(auth_token):
     except Exception as e:
         print(f"Error fetching credentials: {str(e)}")
         return None
-
-
-def extract_keywords(description):
-    """Extract important keywords from description, removing stopwords"""
-    try:
-        # Tokenize
-        tokens = word_tokenize(description.lower())
-        
-        # Get stopwords
-        try:
-            stop_words = set(stopwords.words('english'))
-        except:
-            # If stopwords not available, use basic list
-            stop_words = {'a', 'an', 'the', 'is', 'are', 'was', 'were', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'from'}
-        
-        # Filter tokens
-        keywords = [word for word in tokens if word.isalnum() and word not in stop_words and len(word) > 2]
-        
-        # Deduplicate while preserving order
-        seen = set()
-        unique_keywords = []
-        for kw in keywords:
-            if kw not in seen:
-                seen.add(kw)
-                unique_keywords.append(kw)
-        
-        # Return top 10 keywords
-        return ', '.join(unique_keywords[:10])
-    except Exception as e:
-        print(f"Keyword extraction error: {e}")
-        return description
-
-
-def generate_image_description(image_path):
-    """Generate image description using BLIP model and extract keywords"""
-    try:
-        processor, model = load_blip_model()
-        
-        # Load image
-        image = Image.open(image_path).convert('RGB')
-        
-        # Process image
-        inputs = processor(image, return_tensors="pt")
-        
-        # Generate caption
-        out = model.generate(**inputs, max_length=50)
-        description = processor.decode(out[0], skip_special_tokens=True)
-        
-        print(f"Generated description: {description}")
-        
-        # Extract keywords
-        keywords = extract_keywords(description)
-        print(f"Extracted keywords: {keywords}")
-        
-        return keywords
-    except Exception as e:
-        print(f"Image description error: {e}")
-        return None
-
-
-def detect_faces_and_crop(image_path):
-    """Detect faces in image using DeepFace and crop them"""
-    try:
-        print(f"Detecting faces in {image_path}...")
-        
-        # Detect faces using DeepFace
-        faces = DeepFace.extract_faces(
-            img_path=image_path,
-            detector_backend='opencv',
-            enforce_detection=False,
-            align=True
-        )
-        
-        if not faces or len(faces) == 0:
-            print("No faces detected")
-            return []
-        
-        print(f"Detected {len(faces)} face(s)")
-        
-        # Load original image for cropping
-        original_image = cv2.imread(image_path)
-        height, width = original_image.shape[:2]
-        
-        result_faces = []
-        
-        for idx, face_data in enumerate(faces):
-            try:
-                # Get face region
-                facial_area = face_data['facial_area']
-                x, y, w, h = facial_area['x'], facial_area['y'], facial_area['w'], facial_area['h']
-                confidence = face_data['confidence']
-                
-                # Skip low confidence detections
-                if confidence < 0.5:
-                    print(f"Skipping face {idx} due to low confidence: {confidence}")
-                    continue
-                
-                # Add padding around face (20%)
-                padding = int(max(w, h) * 0.2)
-                x1 = max(0, x - padding)
-                y1 = max(0, y - padding)
-                x2 = min(width, x + w + padding)
-                y2 = min(height, y + h + padding)
-                
-                # Crop face
-                face_crop = original_image[y1:y2, x1:x2]
-                
-                # Get face embedding/descriptor using DeepFace
-                face_embedding = DeepFace.represent(
-                    img_path=face_crop,
-                    model_name='Facenet',
-                    enforce_detection=False
-                )[0]['embedding']
-                
-                result_faces.append({
-                    'box': {'x': x, 'y': y, 'width': w, 'height': h},
-                    'confidence': confidence,
-                    'descriptor': face_embedding,
-                    'cropped_image': face_crop
-                })
-                
-                print(f"Processed face {idx}: confidence={confidence:.2f}")
-                
-            except Exception as e:
-                print(f"Error processing face {idx}: {e}")
-                continue
-        
-        return result_faces
-        
-    except Exception as e:
-        print(f"Face detection error: {e}")
-        import traceback
-        traceback.print_exc()
-        return []
-
-
-def upload_image_to_imgbb(image_data, api_key):
-    """Upload image to ImgBB"""
-    try:
-        # Convert to base64
-        if isinstance(image_data, np.ndarray):
-            # Convert numpy array to image
-            _, buffer = cv2.imencode('.jpg', image_data)
-            image_bytes = buffer.tobytes()
-            base64_data = base64.b64encode(image_bytes).decode('utf-8')
-        else:
-            base64_data = image_data
-        
-        # Upload to ImgBB
-        response = requests.post(
-            f"https://api.imgbb.com/1/upload?key={api_key}",
-            data={'image': base64_data},
-            timeout=30
-        )
-        
-        data = response.json()
-        if data.get('success'):
-            return data['data']['url']
-        else:
-            print(f"ImgBB upload failed: {data}")
-            return None
-    except Exception as e:
-        print(f"ImgBB upload error: {e}")
-        return None
-
-
-def process_image_background(file_path, file_id, user_id, credentials):
-    """Background processing: face detection, image description, face cropping"""
-    try:
-        print(f"Starting background processing for file {file_id}")
-        
-        # Check if it's an image
-        mime_type = get_mime_type(file_path)
-        if not mime_type or not mime_type.startswith('image/'):
-            print(f"Not an image file: {mime_type}")
-            return
-        
-        # Generate image description
-        image_description = generate_image_description(file_path)
-        
-        # Detect faces
-        detected_faces = detect_faces_and_crop(file_path)
-        
-        # Process faces - upload cropped faces
-        processed_faces = []
-        for face_data in detected_faces:
-            face_image_url = None
-            
-            # Upload cropped face to imgbb/cloudinary
-            if credentials.get('imgbb_api_key'):
-                face_image_url = upload_image_to_imgbb(
-                    face_data['cropped_image'],
-                    credentials['imgbb_api_key']
-                )
-            
-            if face_image_url:
-                processed_faces.append({
-                    'box': face_data['box'],
-                    'descriptor': face_data['descriptor'],
-                    'confidence': float(face_data['confidence']),
-                    'face_image_url': face_image_url
-                })
-        
-        # Send data to backend
-        send_processed_data_to_backend(
-            file_id=file_id,
-            user_id=user_id,
-            image_description=image_description,
-            faces=processed_faces
-        )
-        
-        print(f"Background processing complete for file {file_id}")
-        
-    except Exception as e:
-        print(f"Background processing error: {e}")
-        import traceback
-        traceback.print_exc()
-
-
-def send_processed_data_to_backend(file_id, user_id, image_description, faces):
-    """Send processed face data and image description to backend"""
-    try:
-        data = {
-            'file_id': file_id,
-            'user_id': user_id,
-            'image_description': image_description,
-            'faces': faces
-        }
-        
-        response = requests.post(
-            f"{CONFIG['BACKEND_URL']}/api/worker/process-complete",
-            json=data,
-            timeout=30
-        )
-        
-        if response.status_code == 200:
-            print(f"Successfully sent processed data to backend for file {file_id}")
-        else:
-            print(f"Failed to send data to backend: {response.status_code} - {response.text}")
-            
-    except Exception as e:
-        print(f"Error sending data to backend: {e}")
 
 
 @app.get('/health')
@@ -408,6 +130,7 @@ async def upload_file(
             'credentials': credentials,
             'telegram_progress': 0,
             'message_id': None,
+            'file_id': None,
             'error': None
         }
         
@@ -476,17 +199,11 @@ async def complete_upload(request: Request):
 
 def upload_to_telegram_background(upload_id):
     """Background function to upload file to Telegram"""
-    file_path = None
-    file_id = None
-    user_id = None
-    credentials = None
-    
     try:
         progress = upload_progress[upload_id]
         file_path = progress['file_path']
         file_size = progress['file_size']
         credentials = progress['credentials']
-        user_id = credentials.get('user_id')
         
         # Decide whether to use Bot API or Client API
         if file_size <= CONFIG['BOT_API_SIZE_LIMIT']:
@@ -495,32 +212,6 @@ def upload_to_telegram_background(upload_id):
         else:
             # Use Telethon Client API for files > 50MB
             upload_with_client_api(upload_id, file_path, credentials)
-        
-        # After successful upload, trigger background processing
-        # Get file_id from backend if available
-        if progress['status'] == 'completed':
-            # Start background processing in a separate thread
-            # Make a copy of file for processing since we'll delete the original
-            processing_file_path = file_path + '_processing'
-            import shutil
-            if os.path.exists(file_path):
-                shutil.copy2(file_path, processing_file_path)
-                
-                # Get file_id from progress (this needs to be set by upload completion)
-                # For now, we'll need to track this differently
-                # We can get it from the upload response or pass it through
-                
-                processing_thread = threading.Thread(
-                    target=lambda: process_and_cleanup(
-                        processing_file_path,
-                        upload_id,
-                        user_id,
-                        credentials
-                    )
-                )
-                processing_thread.daemon = True
-                processing_thread.start()
-                print(f"Started background processing for upload {upload_id}")
             
     except Exception as e:
         print(f"Background upload error for {upload_id}: {str(e)}")
@@ -529,62 +220,13 @@ def upload_to_telegram_background(upload_id):
         upload_progress[upload_id]['status'] = 'failed'
         upload_progress[upload_id]['error'] = str(e)
     finally:
-        # Cleanup original file after upload (success or failure)
+        # Cleanup file after upload (success or failure)
         try:
-            if file_path and os.path.exists(file_path):
+            if os.path.exists(file_path):
                 os.remove(file_path)
                 print(f"Cleaned up temporary file: {file_path}")
         except Exception as e:
             print(f"Error cleaning up file: {str(e)}")
-
-
-def process_and_cleanup(processing_file_path, upload_id, user_id, credentials):
-    """Process image and cleanup - runs in separate thread"""
-    try:
-        # Wait a bit for backend to create the file entry
-        time.sleep(2)
-        
-        # Get message_id from upload progress
-        message_id = upload_progress.get(upload_id, {}).get('message_id')
-        if not message_id:
-            print(f"Warning: No message_id found for upload {upload_id}, skipping processing")
-            return
-        
-        # Query backend to get file_id by message_id
-        file_id = get_file_id_by_message_id(message_id, user_id)
-        if not file_id:
-            print(f"Warning: Could not find file_id for message_id {message_id}")
-            return
-        
-        process_image_background(processing_file_path, file_id, user_id, credentials)
-    finally:
-        # Cleanup processing file
-        try:
-            if os.path.exists(processing_file_path):
-                os.remove(processing_file_path)
-                print(f"Cleaned up processing file: {processing_file_path}")
-        except Exception as e:
-            print(f"Error cleaning up processing file: {e}")
-
-
-def get_file_id_by_message_id(message_id, user_id):
-    """Query backend to get file_id by telegram message_id"""
-    try:
-        response = requests.get(
-            f"{CONFIG['BACKEND_URL']}/api/worker/file-by-message/{message_id}",
-            params={'user_id': user_id},
-            timeout=10
-        )
-        
-        if response.status_code == 200:
-            data = response.json()
-            return data.get('file_id')
-        else:
-            print(f"Failed to get file_id: {response.status_code}")
-            return None
-    except Exception as e:
-        print(f"Error getting file_id: {e}")
-        return None
 
 
 def upload_with_bot_api(upload_id, file_path, credentials):
