@@ -6,6 +6,8 @@ import requests
 import hashlib
 import json
 import time
+import shutil
+from typing import List, Optional
 from datetime import datetime
 import threading
 from telethon import TelegramClient
@@ -100,7 +102,7 @@ async def upload_file(
     authToken: str = Form(...),
     file: UploadFile = File(...)
 ):
-    """Handle file upload - stores file temporarily and returns upload ID"""
+    """Handle legacy single-file upload"""
     try:
         # Get credentials
         credentials = get_credentials(authToken)
@@ -148,9 +150,122 @@ async def upload_file(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post('/upload-chunk')
+async def upload_chunk(
+    uploadId: str = Form(...),
+    chunkIndex: int = Form(...),
+    totalChunks: int = Form(...),
+    fileName: str = Form(...),
+    chunk: UploadFile = File(...),
+    authToken: str = Form(...),
+    fileSize: int = Form(None)
+):
+    """Handle chunk upload"""
+    try:
+        # Validate inputs
+        if not uploadId or chunkIndex is None:
+            raise HTTPException(status_code=400, detail='Missing required fields')
+
+        # Get credentials (check cache or fetch)
+        credentials = get_credentials(authToken)
+        if not credentials:
+            raise HTTPException(status_code=401, detail='Invalid or expired credentials')
+
+        # Create upload directory for this upload_id if not exists
+        upload_dir = os.path.join(CONFIG['UPLOAD_DIR'], uploadId)
+        os.makedirs(upload_dir, exist_ok=True)
+        
+        # Save chunk
+        chunk_path = os.path.join(upload_dir, str(chunkIndex))
+        content = await chunk.read()
+        
+        with open(chunk_path, 'wb') as f:
+            f.write(content)
+            
+        # Initialize or update upload progress
+        if uploadId not in upload_progress:
+            upload_progress[uploadId] = {
+                'status': 'uploading_chunks',
+                'file_name': fileName,
+                'total_chunks': totalChunks,
+                'file_size': fileSize,
+                'credentials': credentials,
+                'received_chunks': set(),
+                'telegram_progress': 0,
+                'message_id': None,
+                'file_id': None,
+                'error': None
+            }
+        
+        # Track received chunk
+        if 'received_chunks' not in upload_progress[uploadId]:
+             upload_progress[uploadId]['received_chunks'] = set()
+             
+        upload_progress[uploadId]['received_chunks'].add(chunkIndex)
+        
+        return {
+            "success": True, 
+            "chunkIndex": chunkIndex,
+            "receivedChunks": len(upload_progress[uploadId]['received_chunks'])
+        }
+
+    except Exception as e:
+        print(f"Chunk upload error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get('/upload-status/{upload_id}')
+async def get_chunk_upload_status(upload_id: str):
+    """Get status of chunked upload for resume capability"""
+    if upload_id not in upload_progress:
+        raise HTTPException(status_code=404, detail='Upload not found')
+        
+    progress = upload_progress[upload_id]
+    
+    # Check if it was a completed upload
+    if progress.get('status') == 'completed':
+         return {
+            "status": "completed",
+            "uploadedChunks": list(range(progress.get('total_chunks', 0))),
+            "messageId": progress.get('message_id'),
+            "fileId": progress.get('file_id')
+        }
+        
+    # Return list of received chunks
+    received_chunks = list(progress.get('received_chunks', []))
+    return {
+        "status": progress.get('status', 'unknown'),
+        "uploadedChunks": received_chunks,
+        "uploadId": upload_id
+    }
+
+
+@app.post('/cancel-upload')
+async def cancel_upload(data: dict):
+    """Cancel upload and clean up chunks"""
+    upload_id = data.get('uploadId')
+    if not upload_id:
+        raise HTTPException(status_code=400, detail='Missing uploadId')
+        
+    try:
+        # Remove from progress tracking
+        if upload_id in upload_progress:
+            del upload_progress[upload_id]
+            
+        # Remove chunks directory
+        upload_dir = os.path.join(CONFIG['UPLOAD_DIR'], upload_id)
+        if os.path.exists(upload_dir):
+            shutil.rmtree(upload_dir)
+            
+        return {"success": True}
+    except Exception as e:
+        print(f"Cancel error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post('/complete-upload')
 async def complete_upload(request: Request):
-    """Complete the upload by sending to Telegram in background"""
+    """Complete the upload by assembling chunks and sending to Telegram"""
     try:
         data = await request.json()
         upload_id = data.get('uploadId')
@@ -160,15 +275,56 @@ async def complete_upload(request: Request):
         
         progress = upload_progress[upload_id]
         
-        if progress['status'] == 'uploading':
-            raise HTTPException(status_code=400, detail='Upload already in progress')
-        
-        if progress['status'] == 'completed':
+        # If it's a legacy single-file upload
+        if progress.get('status') == 'uploaded':
+             # Already ready to upload to telegram
+             pass
+        # If it's a chunked upload
+        elif progress.get('status') == 'uploading_chunks':
+            # Verify we have all chunks
+            total_chunks = progress.get('total_chunks')
+            received_chunks = progress.get('received_chunks', set())
+            
+            if len(received_chunks) < total_chunks:
+                raise HTTPException(status_code=400, detail=f"Incomplete upload: {len(received_chunks)}/{total_chunks} chunks")
+            
+            # Assemble file
+            upload_dir = os.path.join(CONFIG['UPLOAD_DIR'], upload_id)
+            final_file_path = os.path.join(CONFIG['UPLOAD_DIR'], f"{upload_id}_final")
+            
+            print(f"Assembling {total_chunks} chunks for {upload_id}...")
+            
+            with open(final_file_path, 'wb') as outfile:
+                for i in range(total_chunks):
+                    chunk_path = os.path.join(upload_dir, str(i))
+                    if not os.path.exists(chunk_path):
+                        raise HTTPException(status_code=400, detail=f"Missing chunk {i}")
+                        
+                    with open(chunk_path, 'rb') as infile:
+                        outfile.write(infile.read())
+            
+            # Cleanup chunks directory
+            try:
+                shutil.rmtree(upload_dir)
+            except:
+                pass
+                
+            # Update progress object for telegram upload phase
+            progress['status'] = 'assembled'
+            progress['file_path'] = final_file_path
+            progress['file_size'] = os.path.getsize(final_file_path)
+            # Remove set as it's not JSON serializable if we dump it later, though we keep in memory
+            if 'received_chunks' in progress:
+                del progress['received_chunks']
+                
+        elif progress.get('status') == 'completed':
             return {
                 'status': 'completed',
                 'messageId': progress['message_id'],
                 'fileId': progress['file_id']
             }
+        elif progress.get('status') == 'uploading':
+             raise HTTPException(status_code=400, detail='Upload to Telegram already in progress')
         
         # Start upload in background thread
         progress['status'] = 'uploading'
@@ -353,11 +509,18 @@ async def upload_to_telegram_client(file_path, file_name, credentials, upload_id
         print(f"Channel entity resolved: {channel.id}")
         
         # Progress callback
+        last_logged_percent = -1
+        
         def progress_callback(current, total):
+            nonlocal last_logged_percent
             progress_percent = int((current / total) * 100)
             upload_progress[upload_id]['telegram_progress'] = progress_percent
-            if progress_percent % 10 == 0:  # Log every 10%
-                print(f"Upload progress: {progress_percent}% ({current}/{total} bytes)")
+            
+            # Log only when percentage changes and hits a 5% marker, or strictly every 10%
+            if progress_percent != last_logged_percent:
+                if progress_percent % 10 == 0:
+                    print(f"Upload progress: {progress_percent}% ({current}/{total} bytes)")
+                    last_logged_percent = progress_percent
         
         # Upload file
         print(f"Starting Telethon upload: {file_name}")
@@ -402,11 +565,11 @@ async def get_upload_progress(upload_id: str):
         progress = upload_progress[upload_id]
         
         return {
-            'status': progress['status'],
-            'telegram_progress': progress['telegram_progress'],
-            'message_id': progress['message_id'],
-            'file_id': progress['file_id'],
-            'error': progress['error']
+            'status': progress.get('status'),
+            'telegram_progress': progress.get('telegram_progress', 0),
+            'message_id': progress.get('message_id'),
+            'file_id': progress.get('file_id'),
+            'error': progress.get('error')
         }
         
     except HTTPException:
