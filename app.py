@@ -1608,6 +1608,72 @@ async def process_import_job(req: ImportRequest):
         except Exception as e:
             print(f"⚠️ Cleanup error: {e}")
 
+
+@app.post("/delete-files")
+async def delete_files_background(data: dict, background_tasks: BackgroundTasks):
+    """Queue file deletion as background task"""
+    background_tasks.add_task(
+        process_file_deletions,
+        data["files"],
+        data["bot_token"],
+        data["channel_id"],
+        data["callback_url"],
+        data["user_id"]
+    )
+    
+    return {"status": "queued", "file_count": len(data["files"])}
+
+
+def process_file_deletions(files: list, bot_token: str, channel_id: str, callback_url: str, user_id: str):
+    """Delete files from Telegram and notify backend"""
+    deleted_file_ids = []
+    
+    print(f"🗑️ Starting deletion of {len(files)} files")
+    
+    for file in files:
+        try:
+            # Delete from Telegram
+            if file.get("telegram_msg_id"):
+                response = requests.post(
+                    f"https://api.telegram.org/bot{bot_token}/deleteMessage",
+                    json={
+                        "chat_id": channel_id,
+                        "message_id": file["telegram_msg_id"]
+                    },
+                    timeout=10
+                )
+                
+                if response.status_code == 200:
+                    print(f"✅ Deleted Telegram msg {file['telegram_msg_id']}")
+                else:
+                    print(f"⚠️ Failed to delete msg {file['telegram_msg_id']}: {response.text}")
+            
+            deleted_file_ids.append(file["id"])
+            
+        except Exception as e:
+            print(f"❌ Failed to delete file {file.get('id', 'unknown')}: {e}")
+    
+    # Notify backend to cleanup DB
+    try:
+        print(f"📞 Notifying backend: {len(deleted_file_ids)} files deleted")
+        response = requests.post(
+            callback_url,
+            json={
+                "user_id": user_id,
+                "deleted_file_ids": deleted_file_ids
+            },
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            print(f"✅ Backend notified successfully")
+        else:
+            print(f"⚠️ Backend notification failed: {response.text}")
+            
+    except Exception as e:
+        print(f"❌ Failed to notify backend: {e}")
+
+
 def get_file_id_fast(message):
     if message.document: return str(message.document.id)
     if message.photo: return str(message.photo.id)
