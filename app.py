@@ -201,10 +201,16 @@ class ListenerManager:
         self.is_running = True
         print("Starting Telegram Listeners...")
         
-        # 1. Get info about this worker (e.g. from env or hardcoded for now)
-        # In a real setup, this container would know its own public URL
-        # For this demo, we assume we are running on port 8001
-        worker_url = "http://127.0.0.1:8001" 
+        # Auto-detect worker URL from environment
+        # On Render, RENDER_EXTERNAL_URL is automatically set to the public URL
+        if 'RENDER_EXTERNAL_URL' in os.environ:
+            worker_url = os.environ['RENDER_EXTERNAL_URL']
+            print(f"Detected Render deployment: {worker_url}")
+        else:
+            # Local development fallback
+            port = os.environ.get('PORT', '8001')
+            worker_url = f"http://127.0.0.1:{port}"
+            print(f"Local development mode: {worker_url}") 
         
         try:
             response = requests.get(
@@ -235,7 +241,7 @@ class ListenerManager:
                 os.environ.get('TELEGRAM_API_HASH', 'b18441a1ff607e10a989891a5462e627')
             )
             
-            await client.connect()
+            await client.connect() 
             
             if not await client.is_user_authorized():
                 print(f"User {user['user_id']} session expired")
