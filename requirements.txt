@@ -1,9 +1,10 @@
-Flask
-Flask-Cors
+fastapi
+uvicorn[standard]
 requests
-Werkzeug
 gunicorn
 telethon
-cryptg
-uvicorn[standard]
 python-multipart
+gdown
+gdown
+cryptg
+psutil
