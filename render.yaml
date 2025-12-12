@@ -22,7 +22,6 @@ services:
       # Optional: Python version
       - key: PYTHON_VERSION
         value: 3.11.0
-        sync: false
     
     # Health check endpoint
     healthCheckPath: /
