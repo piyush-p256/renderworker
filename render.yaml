@@ -18,7 +18,6 @@ services:
     envVars:
       - key: BACKEND_URL
         value: https://teledrive-hhh9.onrender.com  # Replace with your TeleStore backend URL
-        sync: false
       
       # Optional: Python version
       - key: PYTHON_VERSION
