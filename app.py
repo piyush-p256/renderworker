@@ -150,7 +150,7 @@ app.add_middleware(
 
 # Configuration
 CONFIG = {
-    'BACKEND_URL': os.environ.get('BACKEND_URL', 'https://teledrive-hhh9.onrender.com'),
+    'BACKEND_URL': os.environ.get('BACKEND_URL', 'https://teledrive-hhh9.onrender.com').rstrip('/'),
     'MAX_CHUNK_SIZE': 50 * 1024 * 1024,  # 50MB per chunk
     'UPLOAD_DIR': '/tmp/uploads',
     'BOT_API_SIZE_LIMIT': 50 * 1024 * 1024,  # 50MB - use Bot API up to 50MB
@@ -789,6 +789,7 @@ def upload_with_bot_api(upload_id, file_path, credentials):
         progress['file_id'] = file_id
         
         print(f"Bot API upload completed: message_id={telegram_result['message_id']}, file_id={file_id}")
+        print(f"✅ Processing complete for {file_name}")
         
     except Exception as e:
         print(f"Bot API upload error: {str(e)}")
@@ -829,10 +830,10 @@ def upload_with_client_api(upload_id, file_path, credentials):
             # Update progress with result
             progress['status'] = 'completed'
             progress['telegram_progress'] = 100
-            progress['message_id'] = result['message_id']
             progress['file_id'] = result['file_id']
             
             print(f"Telethon upload completed: message_id={result['message_id']}, file_id={result['file_id']}")
+            print(f"✅ Processing complete for {file_name}")
             
         finally:
             loop.close()
@@ -1570,7 +1571,8 @@ async def process_import_job(req: ImportRequest):
                 'telegram_file_id': uploaded_file_id,
                 'folder_id': req.target_folder_id,
                 'user_id': req.user_id,
-                'process_faces': False 
+                'process_faces': False,
+                'needs_processing': mimetypes.guess_type(file_path)[0].startswith('image/') if mimetypes.guess_type(file_path)[0] else False
             }
             
             try:
