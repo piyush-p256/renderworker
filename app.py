@@ -150,11 +150,17 @@ app.add_middleware(
 
 # Configuration
 CONFIG = {
-    'BACKEND_URL': os.environ.get('BACKEND_URL', 'http://127.0.0.1:8000'),
+    'BACKEND_URL': os.environ.get('BACKEND_URL', 'http://127.0.0.1:8000').rstrip('/'),
     'MAX_CHUNK_SIZE': 50 * 1024 * 1024,  # 50MB per chunk
     'UPLOAD_DIR': '/tmp/uploads',
     'BOT_API_SIZE_LIMIT': 50 * 1024 * 1024,  # 50MB - use Bot API up to 50MB
 }
+
+if CONFIG['BACKEND_URL'] == 'http://127.0.0.1:8000':
+    print("\n⚠️  WARNING: Using default BACKEND_URL (http://127.0.0.1:8000)")
+    print("   If this is a production deployment, ensure BACKEND_URL environment variable is set.\n")
+else:
+    print(f"\n✅ Worker configured with BACKEND_URL: {CONFIG['BACKEND_URL']}\n")
 
 # In-memory storage for credentials cache and upload progress
 credentials_cache = {}
@@ -230,7 +236,10 @@ class ListenerManager:
                 await self.start_client(user)
                 
         except Exception as e:
-            print(f"Error starting listeners: {str(e)}")
+            print(f"❌ Error starting listeners: Failed to connect to backend at {CONFIG['BACKEND_URL']}")
+            print(f"   Details: {str(e)}")
+            if "Connection refused" in str(e):
+                print("   💡 Hint: The backend might be down or the BACKEND_URL is incorrect.")
 
     async def start_client(self, user):
         """Start a single user client"""
@@ -339,7 +348,7 @@ def get_credentials(auth_token):
             print(f"Failed to fetch credentials: {response.status_code}")
             return None
     except Exception as e:
-        print(f"Error fetching credentials: {str(e)}")
+        print(f"❌ Error fetching credentials from {CONFIG['BACKEND_URL']}/api/worker/credentials: {str(e)}")
         return None
 
 
@@ -557,7 +566,9 @@ async def upload_chunk(
 async def get_chunk_upload_status(upload_id: str):
     """Get status of chunked upload for resume capability"""
     if upload_id not in upload_progress:
-        raise HTTPException(status_code=404, detail='Upload not found')
+        print(f"⚠️  Upload status requested for unknown ID: {upload_id}")
+        print("   💡 Possible cause: Worker restarted and cleared in-memory progress.")
+        raise HTTPException(status_code=404, detail='Upload not found or worker restarted')
         
     progress = upload_progress[upload_id]
     
