@@ -113,6 +113,7 @@ async def lifespan(app: FastAPI):
     # Startup
     asyncio.create_task(listener_manager.start())
     asyncio.create_task(monitor_resources())
+    asyncio.create_task(cleanup_stale_uploads())
     yield
     # Cleanup
     await listener_manager.stop()
@@ -137,6 +138,47 @@ async def monitor_resources():
         except Exception as e:
             print(f"Resource monitoring error: {str(e)}")
 
+async def cleanup_stale_uploads():
+    """Periodically clean up old upload status from memory"""
+    while True:
+        await asyncio.sleep(300) # Every 5 minutes
+        try:
+            now = time.time()
+            to_remove = []
+            
+            # Retention periods
+            COMPLETED_RETENTION = 3600  # Keep completed/failed for 1 hour (plenty of time for frontend)
+            STALLED_RETENTION = 86400   # Keep stalled/abandoned for 24 hours
+            
+            for upload_id, progress in upload_progress.items():
+                status = progress.get('status')
+                start_time = progress.get('start_time', now)
+                last_update = progress.get('last_update', start_time)
+                
+                if status in ['completed', 'failed', 'cancelled']:
+                    if now - last_update > COMPLETED_RETENTION:
+                        to_remove.append(upload_id)
+                else:
+                    # Stalled uploads
+                    if now - last_update > STALLED_RETENTION:
+                         to_remove.append(upload_id)
+                         
+            if to_remove:
+                print(f"🧹 CLeaning up {len(to_remove)} stale upload sessions")
+                for uid in to_remove:
+                    # Cleanup disk if exists
+                    upload_dir = os.path.join(CONFIG['UPLOAD_DIR'], uid)
+                    if os.path.exists(upload_dir):
+                        try:
+                            shutil.rmtree(upload_dir)
+                        except:
+                            pass
+                    # Remove from memory
+                    del upload_progress[uid]
+                    
+        except Exception as e:
+            print(f"Cleanup error: {str(e)}")
+
 app = FastAPI(lifespan=lifespan)
 
 # Add CORS middleware
@@ -150,7 +192,7 @@ app.add_middleware(
 
 # Configuration
 CONFIG = {
-    'BACKEND_URL': os.environ.get('BACKEND_URL', 'https://teledrive-hhh9.onrender.com').rstrip('/'),
+    'BACKEND_URL': os.environ.get('BACKEND_URL', 'https://teledrive-hhh9.onrender.com'),
     'MAX_CHUNK_SIZE': 50 * 1024 * 1024,  # 50MB per chunk
     'UPLOAD_DIR': '/tmp/uploads',
     'BOT_API_SIZE_LIMIT': 50 * 1024 * 1024,  # 50MB - use Bot API up to 50MB
@@ -471,7 +513,9 @@ async def upload_file(
             'telegram_progress': 0,
             'message_id': None,
             'file_id': None,
-            'error': None
+            'error': None,
+            'start_time': time.time(),
+            'last_update': time.time()
         }
         
         # Start upload in background thread
@@ -542,7 +586,10 @@ async def upload_chunk(
                 'telegram_progress': 0,
                 'message_id': None,
                 'file_id': None,
-                'error': None
+                'file_id': None,
+                'error': None,
+                'start_time': time.time(),
+                'last_update': time.time()
             }
         
         # Track received chunk
@@ -550,6 +597,7 @@ async def upload_chunk(
              upload_progress[uploadId]['received_chunks'] = set()
              
         upload_progress[uploadId]['received_chunks'].add(chunkIndex)
+        upload_progress[uploadId]['last_update'] = time.time()
         
         return {
             "success": True, 
@@ -787,6 +835,7 @@ def upload_with_bot_api(upload_id, file_path, credentials):
         progress['telegram_progress'] = 100
         progress['message_id'] = telegram_result['message_id']
         progress['file_id'] = file_id
+        progress['last_update'] = time.time()
         
         print(f"Bot API upload completed: message_id={telegram_result['message_id']}, file_id={file_id}")
         print(f"✅ Processing complete for {file_name}")
@@ -831,6 +880,8 @@ def upload_with_client_api(upload_id, file_path, credentials):
             progress['status'] = 'completed'
             progress['telegram_progress'] = 100
             progress['file_id'] = result['file_id']
+            progress['message_id'] = result['message_id']
+            progress['last_update'] = time.time()
             
             print(f"Telethon upload completed: message_id={result['message_id']}, file_id={result['file_id']}")
             print(f"✅ Processing complete for {file_name}")
