@@ -8,6 +8,8 @@ import sys
 import subprocess
 import hashlib
 import json
+import json
+import base64
 import time
 import shutil
 from typing import List, Optional
@@ -28,6 +30,12 @@ import uuid
 import re
 import concurrent.futures
 import psutil
+import io
+
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.backends import default_backend
+from cryptography.fernet import Fernet
 
 # ========== RESOURCE MANAGER ==========
 
@@ -192,10 +200,10 @@ app.add_middleware(
 
 # Configuration
 CONFIG = {
-    'BACKEND_URL': os.environ.get('BACKEND_URL', 'https://teledrive-hhh9.onrender.com'),
+    'BACKEND_URL': os.environ.get('BACKEND_URL', 'http://127.0.0.1:8000').rstrip('/'),
     'MAX_CHUNK_SIZE': 50 * 1024 * 1024,  # 50MB per chunk
     'UPLOAD_DIR': '/tmp/uploads',
-    'BOT_API_SIZE_LIMIT': 50 * 1024 * 1024,  # 50MB - use Bot API up to 50MB
+    'BOT_API_SIZE_LIMIT': 20 * 1024 * 1024,  # 20MB - use Bot API up to 20MB
 }
 
 if CONFIG['BACKEND_URL'] == 'http://127.0.0.1:8000':
@@ -366,32 +374,129 @@ listener_manager = ListenerManager()
 
 
 def get_credentials(auth_token):
-    """Fetch and cache user credentials from backend"""
-    # Check cache first (cache for 1 hour)
+    """Fetch and cache user credentials from backend using Secure RSA Exchange"""
+    # Check cache first (cache for 30 seconds)
     cache_key = hashlib.md5(auth_token.encode()).hexdigest()
     if cache_key in credentials_cache:
         cached_data, cached_time = credentials_cache[cache_key]
-        if time.time() - cached_time < 3600:  # 1 hour cache
+        if time.time() - cached_time < 30: 
             return cached_data
     
-    # Fetch from backend
+    # Secure Fetch from backend
     try:
-        response = requests.get(
+        # 1. Generate Ephemeral RSA Key Pair
+        private_key = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=2048,
+            backend=default_backend()
+        )
+        public_key_pem = private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        ).decode()
+        
+        # 2. Send Public Key to Backend
+        response = requests.post(
             f"{CONFIG['BACKEND_URL']}/api/worker/credentials",
+            json={"public_key": public_key_pem},
             headers={'Authorization': f'Bearer {auth_token}'},
             timeout=10
         )
         
         if response.status_code == 200:
-            credentials = response.json()
+            data = response.json()
+            encrypted_key_b64 = data['encrypted_key']
+            encrypted_payload_b64 = data['encrypted_payload']
+            
+            # 3. Decrypt the Symmetric Key using RSA Private Key
+            encrypted_key = base64.b64decode(encrypted_key_b64)
+            symmetric_key = private_key.decrypt(
+                encrypted_key,
+                padding.OAEP(
+                    mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                    algorithm=hashes.SHA256(),
+                    label=None
+                )
+            )
+            
+            # 4. Decrypt Payload using Symmetric Key (Fernet)
+            f = Fernet(symmetric_key)
+            decrypted_payload_json = f.decrypt(encrypted_payload_b64.encode()).decode()
+            credentials = json.loads(decrypted_payload_json)
+            
             credentials_cache[cache_key] = (credentials, time.time())
             return credentials
+            
         else:
-            print(f"Failed to fetch credentials: {response.status_code}")
+            print(f"Failed to fetch credentials: {response.status_code} - {response.text}")
             return None
+            
     except Exception as e:
         print(f"❌ Error fetching credentials from {CONFIG['BACKEND_URL']}/api/worker/credentials: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return None
+
+
+def upload_to_imagekit(file_obj, private_key, file_name):
+    """Upload to ImageKit.io"""
+    try:
+        url = "https://upload.imagekit.io/api/v1/files/upload"
+        files = {'file': file_obj}
+        data = {'fileName': file_name, 'useUniqueFileName': 'true'}
+        res = requests.post(
+            url, 
+            files=files, 
+            data=data, 
+            auth=(private_key, ''), 
+            timeout=30
+        )
+        if res.status_code in [200, 201]:
+            return res.json().get('url')
+        else:
+            print(f"ImageKit Upload Failed: {res.text}")
+    except Exception as e:
+        print(f"ImageKit error: {e}")
+    return None
+
+
+@app.post('/upload-thumbnail')
+async def upload_thumbnail(
+    file: UploadFile = File(...),
+    authToken: str = Form(...)
+):
+    """Proxy endpoint to upload thumbnail to ImageKit securely from worker"""
+    try:
+        # Get credentials
+        credentials = get_credentials(authToken)
+        if not credentials:
+            raise HTTPException(status_code=401, detail='Invalid credentials')
+            
+        active_provider = credentials.get('active_storage_provider', 'imgbb')
+        
+        # Only handle ImageKit (others should be client-side)
+        if active_provider != 'imagekit':
+             raise HTTPException(status_code=400, detail=f'Active provider is {active_provider}, use client-side upload')
+
+        if not credentials.get('imagekit_private_key'):
+             raise HTTPException(status_code=500, detail='ImageKit private key missing')
+
+        # Read file
+        content = await file.read()
+        file_io = io.BytesIO(content)
+        
+        # Upload
+        filename = f"thumb_{int(time.time())}.jpg"
+        url = upload_to_imagekit(file_io, credentials['imagekit_private_key'], filename)
+        
+        if url:
+             return {'success': True, 'url': url}
+        else:
+             raise HTTPException(status_code=500, detail='Upload failed')
+             
+    except Exception as e:
+        print(f"Thumbnail upload error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get('/health')
@@ -905,8 +1010,8 @@ async def fast_upload(client, file_path, file_size, progress_callback=None, task
     import random
     file_id = random.randint(1000000000000, 9999999999999)
     
-    # Semaphore to limit concurrency (10 is safe for Telegram & Render)
-    sem = asyncio.Semaphore(10)
+    # Semaphore to limit concurrency (15 workers for better speed on Render)
+    sem = asyncio.Semaphore(15)
     
     uploaded_bytes = 0
     lock = asyncio.Lock()
@@ -966,15 +1071,18 @@ async def upload_to_telegram_client(file_path, file_name, credentials, upload_id
     """Upload file to Telegram using Telethon with progress tracking"""
     client = None
     try:
-        # Initialize Telethon client
+        # Initialize Telethon client with optimized settings
         client = TelegramClient(
             StringSession(credentials['telegram_session']),
             int(credentials['telegram_api_id']),
-            credentials['telegram_api_hash']
+            credentials['telegram_api_hash'],
+            connection_retries=5,
+            retry_delay=1,
+            flood_sleep_threshold=60  # Wait up to 60s for flood errors
         )
         
         await client.connect()
-        print("Telethon client connected")
+        print("Telethon client connected (optimized settings)")
         
         # Get channel entity
         channel_id = int(credentials['channel_id'])
@@ -1136,15 +1244,32 @@ async def download_file(request: Request, messageId: str, token: str, fileName: 
 async def stream_file_range(request: Request, message_id, credentials, file_name, range_start, range_end):
     """Stream a specific byte range from Telegram file using pure async generator"""
     
-    # Get file size first for headers - single connection approach
-    client = TelegramClient(
-        StringSession(credentials['telegram_session']),
-        int(credentials['telegram_api_id']),
-        credentials['telegram_api_hash']
-    )
+    
+    # Try to reuse existing client from listener to save connection time
+    user_id = credentials.get('user_id')
+    cached_client = listener_manager.clients.get(user_id) if user_id else None
+    
+    should_disconnect = True
+    client = None
+    
+    if cached_client and cached_client.is_connected():
+        print(f"♻️ Reusing active client for user {user_id}")
+        client = cached_client
+        should_disconnect = False
+    else:
+        # Create new client if no cached one available
+        print(f"Creating new client for download (User {user_id} not active listener)")
+        client = TelegramClient(
+            StringSession(credentials['telegram_session']),
+            int(credentials['telegram_api_id']),
+            credentials['telegram_api_hash']
+        )
+        await client.connect()
     
     try:
-        await client.connect()
+        if not client.is_connected():
+            await client.connect()
+            
         channel = await client.get_entity(int(credentials['channel_id']))
         message = await client.get_messages(channel, ids=int(message_id))
         
@@ -1159,41 +1284,79 @@ async def stream_file_range(request: Request, message_id, credentials, file_name
         
         print(f"Streaming range {range_start}-{actual_end} ({bytes_to_send} bytes) from file size {file_size}")
         
-        # Create async generator for streaming
+        # Create async generator for buffered streaming
         async def generate_chunks():
-            """Async generator that yields chunks from Telegram"""
+            """Async generator that yields chunks from Telegram with look-ahead buffering"""
+            # Buffer configuration
+            CHUNK_SIZE = 4 * 1024 * 1024  # 4MB
+            BUFFER_SIZE = 8               # 32MB Buffer
+            
+            queue = asyncio.Queue(maxsize=BUFFER_SIZE)
+            sentinel = object()
+            
+            # Producer: Downloads from Telegram and puts into queue
+            async def producer():
+                try:
+                    downloaded = 0
+                    async for chunk in client.iter_download(
+                        message.media,
+                        offset=range_start,
+                        limit=bytes_to_send,
+                        chunk_size=CHUNK_SIZE
+                    ):
+                        if await request.is_disconnected():
+                            print(f"Client disconnected (producer detected), stopping...")
+                            break
+                            
+                        await queue.put(chunk)
+                        
+                        downloaded += len(chunk)
+                        if downloaded % (5 * 1024 * 1024) == 0:
+                            print(f"Buffered: {downloaded}/{bytes_to_send} bytes")
+                            
+                    await queue.put(sentinel)
+                except Exception as e:
+                    print(f"Producer error: {e}")
+                    # Signal error to consumer
+                    await queue.put(e)
+            
+            # Start producer task
+            producer_task = asyncio.create_task(producer())
+            
+            # Consumer: Yields from queue to response
             try:
-                # Stream chunks with 1MB chunk size for efficiency
-                chunk_size = 1024 * 1024  # 1MB chunks
-                downloaded = 0
-                
-                async for chunk in client.iter_download(
-                    message.media,
-                    offset=range_start,
-                    limit=bytes_to_send,
-                    chunk_size=chunk_size
-                ):
-                    # Check if client disconnected
+                while True:
+                    # Check for disconnect
                     if await request.is_disconnected():
-                        print(f"Client disconnected during download, stopping...")
+                         print("Client disconnected (consumer detected)")
+                         break
+
+                    # Get chunk from buffer
+                    item = await queue.get()
+                    
+                    if item is sentinel:
                         break
                     
-                    downloaded += len(chunk)
-                    if downloaded % (5 * 1024 * 1024) == 0:  # Log every 5MB
-                        print(f"Streamed: {downloaded}/{bytes_to_send} bytes")
-                    
-                    yield bytes(chunk)
-                
-                print(f"Range streaming complete: {downloaded} bytes")
+                    if isinstance(item, Exception):
+                        raise item
+                        
+                    yield bytes(item)
+                    queue.task_done()
                     
             except Exception as e:
                 print(f"Streaming error: {str(e)}")
-                import traceback
-                traceback.print_exc()
+                # Cancel producer if consumer fails
+                producer_task.cancel()
                 raise
             finally:
-                # Disconnect after streaming is complete
-                await client.disconnect()
+                # Ensure we wait for producer to clean up if needed
+                try:
+                    await producer_task
+                except:
+                    pass
+                # Only disconnect if we created the client locally
+                if should_disconnect and client:
+                    await client.disconnect()
         
         # Detect MIME type from filename
         mime_type = get_mime_type(file_name)
@@ -1213,8 +1376,8 @@ async def stream_file_range(request: Request, message_id, credentials, file_name
             }
         )
     except Exception as e:
-        # Ensure we disconnect on error
-        if client:
+        # Ensure we disconnect on error if we own the client
+        if should_disconnect and client:
             await client.disconnect()
         raise
 
@@ -1222,82 +1385,109 @@ async def stream_file_range(request: Request, message_id, credentials, file_name
 async def stream_full_file(request: Request, message_id, credentials, file_name):
     """Stream entire file using pure async generator"""
     
-    # Get file size first for Content-Length header
-    client_temp = TelegramClient(
-        StringSession(credentials['telegram_session']),
-        int(credentials['telegram_api_id']),
-        credentials['telegram_api_hash']
-    )
-    await client_temp.connect()
-    channel_temp = await client_temp.get_entity(int(credentials['channel_id']))
-    message_temp = await client_temp.get_messages(channel_temp, ids=int(message_id))
     
-    if not message_temp or not message_temp.file:
-        await client_temp.disconnect()
-        raise Exception(f"Message {message_id} not found or has no file")
+    # Try to reuse existing client from listener to save connection time
+    user_id = credentials.get('user_id')
+    cached_client = listener_manager.clients.get(user_id) if user_id else None
     
-    file_size = message_temp.file.size
-    await client_temp.disconnect()
+    should_disconnect = True
+    client = None
     
-    async def generate_chunks():
-        """Async generator for full file download"""
-        client = None
-        try:
-            client = TelegramClient(
-                StringSession(credentials['telegram_session']),
-                int(credentials['telegram_api_id']),
-                credentials['telegram_api_hash']
-            )
-            
+    if cached_client and cached_client.is_connected():
+        print(f"♻️ Reusing active client for user {user_id}")
+        client = cached_client
+        should_disconnect = False
+    else:
+        # Create new client if no cached one available
+        print(f"Creating new client for download (User {user_id} not active listener)")
+        client = TelegramClient(
+            StringSession(credentials['telegram_session']),
+            int(credentials['telegram_api_id']),
+            credentials['telegram_api_hash']
+        )
+        await client.connect()
+    
+    try:
+        if not client.is_connected():
             await client.connect()
             
-            channel = await client.get_entity(int(credentials['channel_id']))
-            message = await client.get_messages(channel, ids=int(message_id))
+        channel = await client.get_entity(int(credentials['channel_id']))
+        message = await client.get_messages(channel, ids=int(message_id))
+        
+        if not message or not message.file:
+            raise Exception(f"Message {message_id} not found or has no file")
+        
+        file_size = message.file.size
+        
+        async def generate_chunks():
+            """Async generator for full file download with buffering"""
+            # Buffer configuration
+            CHUNK_SIZE = 4 * 1024 * 1024  # 4MB
+            BUFFER_SIZE = 8               # 32MB Buffer
             
-            if not message or not message.file:
-                raise Exception(f"Message {message_id} not found or has no file")
+            queue = asyncio.Queue(maxsize=BUFFER_SIZE)
+            sentinel = object()
             
-            print(f"Downloading full file: {file_name} ({message.file.size} bytes)")
+            async def producer():
+                try:
+                    downloaded = 0
+                    async for chunk in client.iter_download(message.media, chunk_size=CHUNK_SIZE):
+                        if await request.is_disconnected():
+                            print(f"Client disconnected during download, stopping...")
+                            break
+                        
+                        await queue.put(chunk)
+                        downloaded += len(chunk)
+                        
+                        if downloaded % (10 * 1024 * 1024) == 0:
+                            print(f"Buffered: {downloaded}/{message.file.size} bytes")
+                            
+                    await queue.put(sentinel)
+                except Exception as e:
+                    print(f"Producer error: {e}")
+                    await queue.put(e)
+
+            producer_task = asyncio.create_task(producer())
             
-            # Stream chunks with 1MB size
-            downloaded = 0
-            async for chunk in client.iter_download(message.media, chunk_size=1024 * 1024):
-                # Check if client disconnected
+            while True:
                 if await request.is_disconnected():
-                    print(f"Client disconnected during download, stopping...")
+                     break
+                
+                item = await queue.get()
+                if item is sentinel:
                     break
                 
-                downloaded += len(chunk)
-                if downloaded % (10 * 1024 * 1024) == 0:  # Log every 10MB
-                    print(f"Downloaded: {downloaded}/{message.file.size} bytes")
+                if isinstance(item, Exception):
+                    raise item
                 
-                yield bytes(chunk)
+                yield bytes(item)
+                queue.task_done()
+                
+            print(f"Full download complete")
+                
+        # Detect MIME type from filename
+        mime_type = get_mime_type(file_name)
+        
+        return StreamingResponse(
+            generate_chunks(),
+            media_type=mime_type,
+            headers={
+                'Content-Disposition': f'attachment; filename="{file_name}"',  # attachment forces download
+                'Accept-Ranges': 'bytes',
+                'Content-Length': str(file_size),
+                'Cache-Control': 'no-cache',
+                'X-Accel-Buffering': 'no'
+            }
+        )
             
-            print(f"Full download complete: {downloaded} bytes")
-                
-        except Exception as e:
-            print(f"Streaming error: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            raise
-        finally:
-            if client:
-                await client.disconnect()
-    
-    # Detect MIME type from filename
-    mime_type = get_mime_type(file_name)
-    
-    return StreamingResponse(
-        generate_chunks(),
-        media_type=mime_type,
-        headers={
-            'Content-Disposition': f'attachment; filename="{file_name}"',  # attachment forces download
-            'Accept-Ranges': 'bytes',
-            'Content-Length': str(file_size),
-            'Cache-Control': 'no-cache',
-            'X-Accel-Buffering': 'no'
-        }
-    )
+    except Exception as e:
+        print(f"Streaming error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        if should_disconnect and client:
+            await client.disconnect()
+        raise
+
 
 
 
@@ -1585,13 +1775,16 @@ async def process_import_job(req: ImportRequest):
                     client = TelegramClient(
                         StringSession(req.telegram_auth['session']),
                         int(req.telegram_auth['api_id']),
-                        req.telegram_auth['api_hash']
+                        req.telegram_auth['api_hash'],
+                        connection_retries=5,
+                        retry_delay=1,
+                        flood_sleep_threshold=60
                     )
                     await client.connect()
                     target_channel = await client.get_entity(int(channel_id))
 
                 # Progress callback wrapper
-                async def callback(current, total):
+                def callback(current, total):
                     file_share = 100 / total_files
                     base_progress = idx * file_share
                     current_file_progress = (current / total) * file_share
@@ -1603,13 +1796,29 @@ async def process_import_job(req: ImportRequest):
                     # Update global progress (50-100 mapped)
                     import_progress[task_id]['progress'] = int(50 + (total_upload_prog / 2))
 
-                # Upload
-                uploaded_msg = await client.send_file(
-                    target_channel,
-                    file_path,
-                    caption=fname,
-                    progress_callback=callback
-                )
+                # Use fast_upload for large files (> 10MB) for better speed
+                if fsize > 10 * 1024 * 1024:
+                    import_progress[task_id]['phase'] = f"Uploading {idx+1}/{total_files}: {fname} (Fast Mode)"
+                    print(f"Using fast_upload for {fname} ({fsize} bytes)")
+                    
+                    # Upload file in parallel chunks
+                    input_file = await fast_upload(client, file_path, fsize, callback, task_id=task_id)
+                    
+                    # Send the uploaded file
+                    uploaded_msg = await client.send_file(
+                        target_channel,
+                        input_file,
+                        caption=fname
+                    )
+                else:
+                    # Use regular send_file for smaller files
+                    uploaded_msg = await client.send_file(
+                        target_channel,
+                        file_path,
+                        caption=fname,
+                        progress_callback=callback
+                    )
+                
                 uploaded_msg_id = str(uploaded_msg.id)
                 uploaded_file_id = get_file_id_fast(uploaded_msg)
             
