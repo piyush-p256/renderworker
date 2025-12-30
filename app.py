@@ -200,7 +200,7 @@ app.add_middleware(
 
 # Configuration
 CONFIG = {
-    'BACKEND_URL': os.environ.get('BACKEND_URL', 'http://127.0.0.1:8000').rstrip('/'),
+    'BACKEND_URL': os.environ.get('BACKEND_URL', 'https://teledrive-hhh9.onrender.com').rstrip('/'),
     'MAX_CHUNK_SIZE': 50 * 1024 * 1024,  # 50MB per chunk
     'UPLOAD_DIR': '/tmp/uploads',
     'BOT_API_SIZE_LIMIT': 20 * 1024 * 1024,  # 20MB - use Bot API up to 20MB
