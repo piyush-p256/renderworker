@@ -501,13 +501,7 @@ async def upload_thumbnail(
 
 @app.get('/health')
 async def health_check():
-    """Health check endpoint with resource stats"""
-    limits = resource_manager.get_limits()
-    return {
-        "status": "ok", 
-        "timestamp": datetime.now().isoformat(),
-        "resources": limits
-    }
+    return "ok", 200
 
 
 @app.get('/bot-file/{file_id}')
