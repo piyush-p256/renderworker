@@ -4,6 +4,8 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import requests
+import httpx
+import httpx
 import sys
 import subprocess
 import hashlib
@@ -203,7 +205,7 @@ CONFIG = {
     'BACKEND_URL': os.environ.get('BACKEND_URL', 'https://teledrive-hhh9.onrender.com').rstrip('/'),
     'MAX_CHUNK_SIZE': 50 * 1024 * 1024,  # 50MB per chunk
     'UPLOAD_DIR': '/tmp/uploads',
-    'BOT_API_SIZE_LIMIT': 20 * 1024 * 1024,  # 20MB - use Bot API up to 20MB
+    'BOT_API_SIZE_LIMIT': 20 * 1024 * 1024, # 20MB (Allowed for Bot API)
 }
 
 if CONFIG['BACKEND_URL'] == 'http://127.0.0.1:8000':
@@ -506,72 +508,109 @@ async def health_check():
 
 @app.get('/bot-file/{file_id}')
 async def stream_bot_file(file_id: str, auth_token: str, request_user_id: Optional[str] = None):
-    """Stream Bot API file or return URL based on ownership"""
+    """Stream Bot API file or return URL based on ownership (Async Version)"""
+    print(f"DEBUG: stream_bot_file called for {file_id}")
     try:
         # Get credentials
         credentials = get_credentials(auth_token)
         if not credentials:
+            print("DEBUG: Credentials failed")
             raise HTTPException(status_code=401, detail='Failed to fetch credentials')
         
         bot_token = credentials.get('bot_token')
         owner_user_id = credentials.get('user_id')
         
         if not bot_token:
+            print("DEBUG: Bot token missing")
             raise HTTPException(status_code=400, detail='Bot token not configured')
         
-        # Call Telegram Bot API to get file
-        bot_response = requests.get(
-            f'https://api.telegram.org/bot{bot_token}/getFile',
-            params={'file_id': file_id},
-            timeout=10
-        )
-        
-        if bot_response.status_code != 200:
-            raise HTTPException(status_code=500, detail='Failed to fetch file from Telegram')
-        
-        bot_data = bot_response.json()
-        if not bot_data.get('ok'):
-            raise HTTPException(status_code=404, detail='File not found')
-        
-        file_path = bot_data['result']['file_path']
-        download_url = f'https://api.telegram.org/file/bot{bot_token}/{file_path}'
-        
-        # Check if requesting user is the owner
-        is_owner = request_user_id == owner_user_id if request_user_id else True
-        
-        if is_owner:
-            # Return direct URL for owner
-            return {'url': download_url, 'file_path': file_path}
-        else:
-            # Stream file for non-owners (security: don't expose bot token)
-            file_response = requests.get(download_url, stream=True)
-            
-            if file_response.status_code != 200:
-                raise HTTPException(status_code=500, detail='Failed to download file')
-            
-            # Get file size from response headers
-            content_length = file_response.headers.get('content-length')
-            
-            headers = {
-                'Content-Disposition': f'inline; filename="{file_path.split("/")[-1]}"',
-                'Cache-Control': 'public, max-age=3600',
-                'Accept-Ranges': 'bytes'
-            }
-            
-            # Add Content-Length for progress tracking
-            if content_length:
-                headers['Content-Length'] = content_length
-            
-            return StreamingResponse(
-                file_response.iter_content(chunk_size=1024 * 1024),  # 1MB chunks like Telethon
-                media_type=file_response.headers.get('content-type', 'application/octet-stream'),
-                headers=headers
+        print("DEBUG: Fetching file path from Telegram...")
+        # Call Telegram Bot API to get file path (Async)
+        async with httpx.AsyncClient() as client:
+            bot_response = await client.get(
+                f'https://api.telegram.org/bot{bot_token}/getFile',
+                params={'file_id': file_id},
+                timeout=10.0
             )
+            
+            print(f"DEBUG: getFile response: {bot_response.status_code}")
+            if bot_response.status_code != 200:
+                print(f"DEBUG: getFile failed: {bot_response.text}")
+                raise HTTPException(status_code=500, detail='Failed to fetch file from Telegram')
+            
+            bot_data = bot_response.json()
+            if not bot_data.get('ok'):
+                print(f"DEBUG: Telegram API error: {bot_data}")
+                raise HTTPException(status_code=404, detail='File not found')
+            
+            file_path = bot_data['result']['file_path']
+            download_url = f'https://api.telegram.org/file/bot{bot_token}/{file_path}'
+            print(f"DEBUG: File path resolved: {file_path}")
+            
+            # Check if requesting user is the owner
+            is_owner = request_user_id == owner_user_id if request_user_id else True
+            
+            if is_owner:
+                print("DEBUG: User is owner, returning URL")
+                # Return direct URL for owner
+                return {'url': download_url, 'file_path': file_path}
+            else:
+                print("DEBUG: Proxying stream for non-owner...")
+                # Stream file for non-owners
+                
+                # HEAD request to get headers first
+                try:
+                    head_resp = await client.head(download_url)
+                    print(f"DEBUG: HEAD response: {head_resp.status_code}")
+                except Exception as e:
+                    print(f"DEBUG: HEAD request failed: {e}")
+                    # Keep going, maybe normal GET works
+                    head_resp = None
+                
+                content_length = None
+                content_type = 'application/octet-stream'
+                
+                if head_resp and head_resp.status_code == 200:
+                    content_length = head_resp.headers.get('content-length')
+                    content_type = head_resp.headers.get('content-type', 'application/octet-stream')
+                
+                headers = {
+                    'Content-Disposition': f'inline; filename="{file_path.split("/")[-1]}"',
+                    'Cache-Control': 'public, max-age=3600',
+                    'Accept-Ranges': 'bytes'
+                }
+                
+                if content_length:
+                    headers['Content-Length'] = content_length
+
+                # Generator for streaming
+                async def iterfile():
+                    try:
+                        print("DEBUG: Starting stream generator...")
+                        async with httpx.AsyncClient(timeout=30.0) as stream_client:
+                            async with stream_client.stream("GET", download_url) as response:
+                                print(f"DEBUG: Stream response status: {response.status_code}")
+                                if response.status_code != 200:
+                                    print(f"DEBUG: Stream failed status {response.status_code}")
+                                    # Can't raise HTTP exception here effectively if headers partially sent
+                                    return 
+                                async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
+                                    yield chunk
+                    except Exception as e:
+                        print(f"DEBUG: Stream generator error: {e}")
+
+                return StreamingResponse(
+                    iterfile(),
+                    media_type=content_type,
+                    headers=headers
+                )
     
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Bot file fetch error: {str(e)}")
+        print(f"Bot file fetch error CRITICAL: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1108,10 +1147,17 @@ async def upload_to_telegram_client(file_path, file_name, credentials, upload_id
         if upload_id in import_cancellation_flags or upload_progress.get(upload_id, {}).get('status') == 'cancelled':
             raise Exception("Cancelled by user")
         
+        # Determine if we should force document type (e.g. for large images > 10MB)
+        force_document = False
+        if file_size > 10 * 1024 * 1024: # 10MB
+            force_document = True
+            print(f"File > 10MB ({file_size}), forcing document upload")
+
         message = await client.send_file(
             channel,
             input_file, # Pass the uploaded file handle
             caption=file_name,
+            force_document=force_document
             # Progress callback is already handled in fast_upload, but send_file might use it 
             # for the final "send", though usually instant. 
             # We don't pass it again to avoid double counting or confusion, 
