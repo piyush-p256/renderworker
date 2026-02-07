@@ -8,6 +8,7 @@ import httpx
 import httpx
 import sys
 import subprocess
+import hmac
 import hashlib
 import json
 import json
@@ -219,12 +220,10 @@ credentials_cache = {}
 upload_progress = {}
 upload_locks = defaultdict(threading.Lock)
 
-# Create upload directory if it doesn't exist
 os.makedirs(CONFIG['UPLOAD_DIR'], exist_ok=True)
 
 print(f"Worker started with BACKEND_URL: {CONFIG['BACKEND_URL']}")
 
-# Check for cryptg
 try:
     import cryptg
     print("🚀 Cryptg detected! Encryption will be fast.")
@@ -244,14 +243,13 @@ def get_mime_type(filename):
     mime_type, _ = mimetypes.guess_type(filename)
     if mime_type:
         return mime_type
-    # Default to octet-stream if unknown
+
     return 'application/octet-stream'
 
-# ========== LISTENER MANAGER ==========
 
 class ListenerManager:
     def __init__(self):
-        self.clients = {} # user_id -> client
+        self.clients = {} 
         self.is_running = False
 
     async def start(self):
@@ -259,13 +257,12 @@ class ListenerManager:
         self.is_running = True
         print("Starting Telegram Listeners...")
         
-        # Auto-detect worker URL from environment
-        # On Render, RENDER_EXTERNAL_URL is automatically set to the public URL
+       
         if 'RENDER_EXTERNAL_URL' in os.environ:
             worker_url = os.environ['RENDER_EXTERNAL_URL']
             print(f"Detected Render deployment: {worker_url}")
         else:
-            # Local development fallback
+            
             port = os.environ.get('PORT', '8001')
             worker_url = f"http://127.0.0.1:{port}"
             print(f"Local development mode: {worker_url}") 
@@ -298,7 +295,7 @@ class ListenerManager:
         try:
             client = TelegramClient(
                 StringSession(user['telegram_session']),
-                int(os.environ.get('TELEGRAM_API_ID', 2040)), # Fallback for demo
+                int(os.environ.get('TELEGRAM_API_ID', 2040)), 
                 os.environ.get('TELEGRAM_API_HASH', 'b18441a1ff607e10a989891a5462e627')
             )
             
@@ -308,10 +305,7 @@ class ListenerManager:
                 print(f"User {user['user_id']} session expired")
                 return
 
-            # Add event handler
-            # We listen to the specific channel ID
-            # Note: channel_id from backend might need adjustment if it doesn't match peer
-            # But usually we listen to the channel
+           
             
             @client.on(events.NewMessage(chats=[user['telegram_channel_id']]))
             async def handler(event):
@@ -329,12 +323,12 @@ class ListenerManager:
             if not event.message.file:
                 return
             
-            # Extract metadata
+            
             file_name = "unknown"
             if event.message.file.name:
                 file_name = event.message.file.name
             else:
-                # Try to guess extension
+                
                 ext = event.message.file.ext or ""
                 file_name = f"telegram_{event.message.id}{ext}"
                 
@@ -343,15 +337,15 @@ class ListenerManager:
             
             print(f"Detected file: {file_name} ({file_size} bytes) for user {user_id}")
             
-            # Register with backend
+            
             payload = {
                 "user_id": user_id,
                 "name": file_name,
                 "size": file_size,
                 "mime_type": mime_type,
                 "telegram_msg_id": event.message.id,
-                "telegram_file_id": None, # Could extract if needed
-                "thumbnail_url": None, # Could extract if needed
+                "telegram_file_id": None, 
+                "thumbnail_url": None, 
                 "date": event.message.date.isoformat()
             }
             
@@ -377,16 +371,16 @@ listener_manager = ListenerManager()
 
 def get_credentials(auth_token):
     """Fetch and cache user credentials from backend using Secure RSA Exchange"""
-    # Check cache first (cache for 30 seconds)
+    
     cache_key = hashlib.md5(auth_token.encode()).hexdigest()
     if cache_key in credentials_cache:
         cached_data, cached_time = credentials_cache[cache_key]
         if time.time() - cached_time < 30: 
             return cached_data
     
-    # Secure Fetch from backend
+   
     try:
-        # 1. Generate Ephemeral RSA Key Pair
+       
         private_key = rsa.generate_private_key(
             public_exponent=65537,
             key_size=2048,
@@ -438,6 +432,116 @@ def get_credentials(auth_token):
         import traceback
         traceback.print_exc()
         return None
+
+
+
+@app.post('/upload-telegram-thumbnail')
+async def upload_telegram_thumbnail(
+    authToken: str = Form(...),
+    file: UploadFile = File(...)
+):
+    """Upload thumbnail to Telegram channel (always uses Bot API as thumbnails are small)"""
+    try:
+        # Get credentials
+        credentials = get_credentials(authToken)
+        if not credentials:
+            raise HTTPException(status_code=401, detail='Invalid or expired credentials')
+            
+        bot_token = credentials.get('bot_token')
+        channel_id = credentials.get('channel_id')
+        
+        if not bot_token or not channel_id:
+            raise HTTPException(status_code=400, detail="Bot token or channel ID not configured")
+
+        # Read file content
+        content = await file.read()
+        
+        # Upload to Telegram via Bot API
+        files = {'photo': ('thumbnail.jpg', content)}
+        data = {'chat_id': channel_id}
+        
+        # Use requests (sync) or httpx (async) - using requests for simplicity matching existing code
+        response = requests.post(
+            f'https://api.telegram.org/bot{bot_token}/sendPhoto',
+            data=data,
+            files=files,
+            timeout=30
+        )
+        
+        result = response.json()
+        
+        if not result.get('ok'):
+             raise HTTPException(status_code=500, detail=f"Telegram API error: {result.get('description')}")
+             
+        # Extract best photo (largest)
+        photos = result['result']['photo']
+        best_photo = photos[-1]
+        
+        return {
+            'success': True,
+            'message_id': result['result']['message_id'],
+            'file_id': best_photo['file_id'],
+            'file_unique_id': best_photo['file_unique_id']
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Thumbnail upload error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get('/telegram-thumbnail/{file_id}')
+async def get_telegram_thumbnail(file_id: str, auth_token: str = None):
+    """Proxy Telegram thumbnail download"""
+    try:
+        if not auth_token:
+            raise HTTPException(status_code=401, detail='Missing auth_token')
+            
+        # Get credentials
+        credentials = get_credentials(auth_token)
+        if not credentials:
+            raise HTTPException(status_code=401, detail='Invalid or expired credentials')
+
+        bot_token = credentials.get('bot_token')
+        
+        # 1. Get File Path
+        response = requests.get(f'https://api.telegram.org/bot{bot_token}/getFile?file_id={file_id}', timeout=10)
+        result = response.json()
+        
+        if not result.get('ok'):
+            raise HTTPException(status_code=404, detail="File not found on Telegram")
+            
+        file_path = result['result']['file_path']
+        
+        # 2. Stream File Content
+        telegram_url = f'https://api.telegram.org/file/bot{bot_token}/{file_path}'
+        
+        # Use simple streaming response
+        async def iterfile():
+            async with httpx.AsyncClient() as client:
+                async with client.stream("GET", telegram_url) as r:
+                    if r.status_code != 200:
+                         return
+                    async for chunk in r.aiter_bytes():
+                        yield chunk
+
+        # Get content type via HEAD or guess
+        content_type = mimetypes.guess_type(file_path)[0] or 'image/jpeg'
+        
+        return StreamingResponse(
+            iterfile(),
+            media_type=content_type,
+            headers={
+                'Cache-Control': 'public, max-age=31536000' # Cache for 1 year
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Thumbnail download error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 def upload_to_imagekit(file_obj, private_key, file_name):
@@ -498,6 +602,39 @@ async def upload_thumbnail(
              
     except Exception as e:
         print(f"Thumbnail upload error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get('/imagekit-auth')
+async def imagekit_auth(authToken: str):
+    """Generate ImageKit authentication parameters for client-side upload"""
+    try:
+        credentials = get_credentials(authToken)
+        if not credentials:
+            raise HTTPException(status_code=401, detail='Invalid credentials')
+            
+        private_key = credentials.get('imagekit_private_key')
+        if not private_key:
+            raise HTTPException(status_code=400, detail='ImageKit private key not configured')
+
+        token = str(uuid.uuid4())
+        expire = int(time.time()) + 1800  # 30 minutes
+        
+        # Create signature
+        signature_input = (token + str(expire)).encode()
+        signature = hmac.new(
+            private_key.encode(),
+            signature_input,
+            hashlib.sha1
+        ).hexdigest()
+
+        return {
+            "token": token,
+            "expire": expire,
+            "signature": signature
+        }
+    except Exception as e:
+        print(f"ImageKit auth error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -864,8 +1001,13 @@ async def complete_upload(request: Request):
                 'fileId': progress['file_id']
             }
         elif progress.get('status') == 'uploading':
-             print(f"Complete upload failed: Upload already in progress for {upload_id}")
-             raise HTTPException(status_code=400, detail='Upload to Telegram already in progress')
+             print(f"DEBUG: Complete upload called while uploading (idempotent success) for {upload_id}")
+             # Return idempotent success
+             return {
+                 'status': 'uploading',
+                 'uploadId': upload_id,
+                 'message': 'Upload to Telegram already in progress'
+             }
         
         # Start upload in background thread
         progress['status'] = 'uploading'
@@ -1411,7 +1553,7 @@ async def stream_file_range(request: Request, message_id, credentials, file_name
                 'Accept-Ranges': 'bytes',
                 'Content-Range': f'bytes {range_start}-{actual_end}/{file_size}',
                 'Content-Length': str(bytes_to_send),
-                'Cache-Control': 'no-cache',
+                'Cache-Control': 'public, max-age=3600, immutable',
                 'X-Accel-Buffering': 'no'
             }
         )
@@ -1515,7 +1657,7 @@ async def stream_full_file(request: Request, message_id, credentials, file_name)
                 'Content-Disposition': f'attachment; filename="{file_name}"',  # attachment forces download
                 'Accept-Ranges': 'bytes',
                 'Content-Length': str(file_size),
-                'Cache-Control': 'no-cache',
+                'Cache-Control': 'public, max-age=3600, immutable',
                 'X-Accel-Buffering': 'no'
             }
         )
@@ -1754,6 +1896,17 @@ async def process_import_job(req: ImportRequest):
         # 2. Upload to Telegram
         total_files = len(downloaded_files)
         
+        # Initialize granular file tracking
+        files_metadata = []
+        for fpath in downloaded_files:
+            files_metadata.append({
+                'name': os.path.basename(fpath),
+                'size': os.path.getsize(fpath),
+                'status': 'pending',
+                'progress': 0
+            })
+        import_progress[task_id]['files'] = files_metadata
+        
         # Determine if we can use Bot API
         bot_token = req.telegram_auth.get('bot_token')
         channel_id = req.telegram_auth['channel_id']
@@ -1770,6 +1923,10 @@ async def process_import_job(req: ImportRequest):
             fname = os.path.basename(file_path)
             fsize = os.path.getsize(file_path)
             import_progress[task_id]['phase'] = f"Uploading {idx+1}/{total_files}: {fname}"
+            
+            # Update specific file status
+            if 'files' in import_progress[task_id] and idx < len(import_progress[task_id]['files']):
+                import_progress[task_id]['files'][idx]['status'] = 'uploading'
             
             uploaded_msg_id = None
             uploaded_file_id = None
@@ -1805,6 +1962,10 @@ async def process_import_job(req: ImportRequest):
                             
                             import_progress[task_id]['upload_progress'] = int(((idx + 1) / total_files) * 100)
                             import_progress[task_id]['progress'] = int(50 + ((idx + 1) / total_files * 50))
+                            
+                            # Update file progress
+                            if 'files' in import_progress[task_id] and idx < len(import_progress[task_id]['files']):
+                                import_progress[task_id]['files'][idx]['progress'] = 100
                 except Exception as ex:
                     print(f"Bot API upload failed, falling back to Client: {ex}")
 
@@ -1835,6 +1996,10 @@ async def process_import_job(req: ImportRequest):
                     
                     # Update global progress (50-100 mapped)
                     import_progress[task_id]['progress'] = int(50 + (total_upload_prog / 2))
+                    
+                    # Update file progress
+                    if 'files' in import_progress[task_id] and idx < len(import_progress[task_id]['files']):
+                        import_progress[task_id]['files'][idx]['progress'] = int((current / total) * 100)
 
                 # Use fast_upload for large files (> 10MB) for better speed
                 if fsize > 10 * 1024 * 1024:
@@ -1884,9 +2049,18 @@ async def process_import_job(req: ImportRequest):
                 if web_res.status_code != 200:
                     print(f"Webhook Failed: {web_res.status_code} - {web_res.text}")
                 else:
-                    print(f"File registered: {fname} (ID: {web_res.json().get('file_id')})")
+                    reg_data = web_res.json()
+                    print(f"File registered: {fname} (ID: {reg_data.get('file_id')})")
+                    # Store file_id in files tracking
+                    if 'files' in import_progress[task_id] and idx < len(import_progress[task_id]['files']):
+                        import_progress[task_id]['files'][idx]['file_id'] = reg_data.get('file_id')
             except Exception as we:
                 print(f"Webhook Connection Error: {we}")
+
+            # Mark file as completed
+            if 'files' in import_progress[task_id] and idx < len(import_progress[task_id]['files']):
+                import_progress[task_id]['files'][idx]['status'] = 'completed'
+                import_progress[task_id]['files'][idx]['progress'] = 100
         
         if client:
             await client.disconnect()
@@ -1960,6 +2134,22 @@ def process_file_deletions(files: list, bot_token: str, channel_id: str, callbac
                     print(f"✅ Deleted Telegram msg {file['telegram_msg_id']}")
                 else:
                     print(f"⚠️ Failed to delete msg {file['telegram_msg_id']}: {response.text}")
+            
+            # Delete Thumbnail from Telegram
+            if file.get("telegram_thumb_msg_id"):
+                response = requests.post(
+                    f"https://api.telegram.org/bot{bot_token}/deleteMessage",
+                    json={
+                        "chat_id": channel_id,
+                        "message_id": file["telegram_thumb_msg_id"]
+                    },
+                    timeout=10
+                )
+                
+                if response.status_code == 200:
+                    print(f"✅ Deleted Telegram thumbnail msg {file['telegram_thumb_msg_id']}")
+                else:
+                    print(f"⚠️ Failed to delete thumbnail msg {file['telegram_thumb_msg_id']}: {response.text}")
             
             deleted_file_ids.append(file["id"])
             
