@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  worker:
+    build: .
+    ports:
+      - "10000:10000"
+    environment:
+      - BACKEND_URL=https://teledrive-hhh9.onrender.com
+      - PORT=10000
+    volumes:
+      - ./uploads:/tmp/uploads
+    restart: always
