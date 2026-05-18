@@ -220,10 +220,12 @@ credentials_cache = {}
 upload_progress = {}
 upload_locks = defaultdict(threading.Lock)
 
+# Create upload directory if it doesn't exist
 os.makedirs(CONFIG['UPLOAD_DIR'], exist_ok=True)
 
 print(f"Worker started with BACKEND_URL: {CONFIG['BACKEND_URL']}")
 
+# Check for cryptg
 try:
     import cryptg
     print("🚀 Cryptg detected! Encryption will be fast.")
@@ -243,13 +245,14 @@ def get_mime_type(filename):
     mime_type, _ = mimetypes.guess_type(filename)
     if mime_type:
         return mime_type
-
+    # Default to octet-stream if unknown
     return 'application/octet-stream'
 
+# ========== LISTENER MANAGER ==========
 
 class ListenerManager:
     def __init__(self):
-        self.clients = {} 
+        self.clients = {} # user_id -> client
         self.is_running = False
 
     async def start(self):
@@ -257,12 +260,13 @@ class ListenerManager:
         self.is_running = True
         print("Starting Telegram Listeners...")
         
-       
+        # Auto-detect worker URL from environment
+        # On Render, RENDER_EXTERNAL_URL is automatically set to the public URL
         if 'RENDER_EXTERNAL_URL' in os.environ:
             worker_url = os.environ['RENDER_EXTERNAL_URL']
             print(f"Detected Render deployment: {worker_url}")
         else:
-            
+            # Local development fallback
             port = os.environ.get('PORT', '8001')
             worker_url = f"http://127.0.0.1:{port}"
             print(f"Local development mode: {worker_url}") 
@@ -295,7 +299,7 @@ class ListenerManager:
         try:
             client = TelegramClient(
                 StringSession(user['telegram_session']),
-                int(os.environ.get('TELEGRAM_API_ID', 2040)), 
+                int(os.environ.get('TELEGRAM_API_ID', 2040)), # Fallback for demo
                 os.environ.get('TELEGRAM_API_HASH', 'b18441a1ff607e10a989891a5462e627')
             )
             
@@ -305,7 +309,10 @@ class ListenerManager:
                 print(f"User {user['user_id']} session expired")
                 return
 
-           
+            # Add event handler
+            # We listen to the specific channel ID
+            # Note: channel_id from backend might need adjustment if it doesn't match peer
+            # But usually we listen to the channel
             
             @client.on(events.NewMessage(chats=[user['telegram_channel_id']]))
             async def handler(event):
@@ -323,12 +330,12 @@ class ListenerManager:
             if not event.message.file:
                 return
             
-            
+            # Extract metadata
             file_name = "unknown"
             if event.message.file.name:
                 file_name = event.message.file.name
             else:
-                
+                # Try to guess extension
                 ext = event.message.file.ext or ""
                 file_name = f"telegram_{event.message.id}{ext}"
                 
@@ -337,15 +344,15 @@ class ListenerManager:
             
             print(f"Detected file: {file_name} ({file_size} bytes) for user {user_id}")
             
-            
+            # Register with backend
             payload = {
                 "user_id": user_id,
                 "name": file_name,
                 "size": file_size,
                 "mime_type": mime_type,
                 "telegram_msg_id": event.message.id,
-                "telegram_file_id": None, 
-                "thumbnail_url": None, 
+                "telegram_file_id": None, # Could extract if needed
+                "thumbnail_url": None, # Could extract if needed
                 "date": event.message.date.isoformat()
             }
             
@@ -371,16 +378,16 @@ listener_manager = ListenerManager()
 
 def get_credentials(auth_token):
     """Fetch and cache user credentials from backend using Secure RSA Exchange"""
-    
+    # Check cache first (cache for 30 seconds)
     cache_key = hashlib.md5(auth_token.encode()).hexdigest()
     if cache_key in credentials_cache:
         cached_data, cached_time = credentials_cache[cache_key]
         if time.time() - cached_time < 30: 
             return cached_data
     
-   
+    # Secure Fetch from backend
     try:
-       
+        # 1. Generate Ephemeral RSA Key Pair
         private_key = rsa.generate_private_key(
             public_exponent=65537,
             key_size=2048,
@@ -644,24 +651,19 @@ async def health_check():
 
 
 @app.get('/bot-file/{file_id}')
-async def stream_bot_file(file_id: str, auth_token: str, request_user_id: Optional[str] = None):
-    """Stream Bot API file or return URL based on ownership (Async Version)"""
-    print(f"DEBUG: stream_bot_file called for {file_id}")
+async def stream_bot_file(file_id: str, auth_token: str, request_user_id: Optional[str] = None, fileName: Optional[str] = None):
+    """Stream Bot API file through worker proxy (always streams to avoid CORS)"""
     try:
         # Get credentials
         credentials = get_credentials(auth_token)
         if not credentials:
-            print("DEBUG: Credentials failed")
             raise HTTPException(status_code=401, detail='Failed to fetch credentials')
         
         bot_token = credentials.get('bot_token')
-        owner_user_id = credentials.get('user_id')
         
         if not bot_token:
-            print("DEBUG: Bot token missing")
             raise HTTPException(status_code=400, detail='Bot token not configured')
         
-        print("DEBUG: Fetching file path from Telegram...")
         # Call Telegram Bot API to get file path (Async)
         async with httpx.AsyncClient() as client:
             bot_response = await client.get(
@@ -670,82 +672,67 @@ async def stream_bot_file(file_id: str, auth_token: str, request_user_id: Option
                 timeout=10.0
             )
             
-            print(f"DEBUG: getFile response: {bot_response.status_code}")
             if bot_response.status_code != 200:
-                print(f"DEBUG: getFile failed: {bot_response.text}")
                 raise HTTPException(status_code=500, detail='Failed to fetch file from Telegram')
             
             bot_data = bot_response.json()
             if not bot_data.get('ok'):
-                print(f"DEBUG: Telegram API error: {bot_data}")
                 raise HTTPException(status_code=404, detail='File not found')
             
             file_path = bot_data['result']['file_path']
             download_url = f'https://api.telegram.org/file/bot{bot_token}/{file_path}'
-            print(f"DEBUG: File path resolved: {file_path}")
             
-            # Check if requesting user is the owner
-            is_owner = request_user_id == owner_user_id if request_user_id else True
+            # Use original filename if provided, otherwise fall back to Telegram path
+            display_name = fileName or file_path.split("/")[-1]
             
-            if is_owner:
-                print("DEBUG: User is owner, returning URL")
-                # Return direct URL for owner
-                return {'url': download_url, 'file_path': file_path}
-            else:
-                print("DEBUG: Proxying stream for non-owner...")
-                # Stream file for non-owners
-                
-                # HEAD request to get headers first
-                try:
-                    head_resp = await client.head(download_url)
-                    print(f"DEBUG: HEAD response: {head_resp.status_code}")
-                except Exception as e:
-                    print(f"DEBUG: HEAD request failed: {e}")
-                    # Keep going, maybe normal GET works
-                    head_resp = None
-                
-                content_length = None
-                content_type = 'application/octet-stream'
-                
-                if head_resp and head_resp.status_code == 200:
+            # HEAD request to get content info
+            content_length = None
+            content_type = 'application/octet-stream'
+            try:
+                head_resp = await client.head(download_url)
+                if head_resp.status_code == 200:
                     content_length = head_resp.headers.get('content-length')
                     content_type = head_resp.headers.get('content-type', 'application/octet-stream')
-                
-                headers = {
-                    'Content-Disposition': f'inline; filename="{file_path.split("/")[-1]}"',
-                    'Cache-Control': 'public, max-age=3600',
-                    'Accept-Ranges': 'bytes'
-                }
-                
-                if content_length:
-                    headers['Content-Length'] = content_length
+            except Exception:
+                pass
+            
+            # Guess content type from filename if Telegram returns generic type
+            if fileName and content_type == 'application/octet-stream':
+                guessed_type = mimetypes.guess_type(fileName)[0]
+                if guessed_type:
+                    content_type = guessed_type
+            
+            headers = {
+                'Content-Disposition': f'inline; filename="{display_name}"',
+                'Cache-Control': 'public, max-age=3600',
+                'Accept-Ranges': 'bytes'
+            }
+            
+            if content_length:
+                headers['Content-Length'] = content_length
 
-                # Generator for streaming
-                async def iterfile():
-                    try:
-                        print("DEBUG: Starting stream generator...")
-                        async with httpx.AsyncClient(timeout=30.0) as stream_client:
-                            async with stream_client.stream("GET", download_url) as response:
-                                print(f"DEBUG: Stream response status: {response.status_code}")
-                                if response.status_code != 200:
-                                    print(f"DEBUG: Stream failed status {response.status_code}")
-                                    # Can't raise HTTP exception here effectively if headers partially sent
-                                    return 
-                                async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
-                                    yield chunk
-                    except Exception as e:
-                        print(f"DEBUG: Stream generator error: {e}")
+            # Always stream through worker to avoid CORS issues
+            async def iterfile():
+                try:
+                    async with httpx.AsyncClient(timeout=30.0) as stream_client:
+                        async with stream_client.stream("GET", download_url) as response:
+                            if response.status_code != 200:
+                                return 
+                            async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
+                                yield chunk
+                except Exception as e:
+                    print(f"Stream generator error: {e}")
 
-                return StreamingResponse(
-                    iterfile(),
-                    media_type=content_type,
-                    headers=headers
-                )
+            return StreamingResponse(
+                iterfile(),
+                media_type=content_type,
+                headers=headers
+            )
     
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Bot file fetch error CRITICAL: {str(e)}")
+        print(f"Bot file fetch error: {str(e)}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
